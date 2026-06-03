@@ -162,12 +162,18 @@ class LivingKVRunner:
                     if a < b:
                         segsum[s] += h[a - i:b - i].sum(0); segcnt[s] += (b - a)
                 del o, h
-        segvec = (segsum / segcnt.clamp_min(1).unsqueeze(1)).float()  # CPU catalog
-        mean = segvec.mean(0, keepdim=True)
-        _, _, Vh = torch.linalg.svd(segvec - mean, full_matrices=False)
-        Vpc = Vh[:self.remove_pc].T if self.remove_pc > 0 else None
+        self._segvec = (segsum / segcnt.clamp_min(1).unsqueeze(1)).float()  # raw CPU catalog (kept for re-tuning)
+        self.rebuild_catalog(self.remove_pc)
+
+    def rebuild_catalog(self, remove_pc):
+        """Re-derive the probe catalog from the raw segment vectors with a different top-PC removal.
+        Cheap (CPU SVD) — lets you tune the probe on a saved cache without re-prefilling."""
+        self.remove_pc = remove_pc
+        mean = self._segvec.mean(0, keepdim=True)
+        _, _, Vh = torch.linalg.svd(self._segvec - mean, full_matrices=False)
+        Vpc = Vh[:remove_pc].T if remove_pc > 0 else None
         self._mean, self._Vpc = mean, Vpc
-        self._seg_emb = self._deanis(segvec)
+        self._seg_emb = self._deanis(self._segvec)
 
     def _deanis(self, x):
         x = x - self._mean.squeeze(0)
@@ -227,6 +233,7 @@ class LivingKVRunner:
             "coldK": self._coldK, "coldV": self._coldV,
             "coldKs": self._coldKs, "coldVs": self._coldVs,
             "mean": self._mean, "Vpc": self._Vpc, "seg_emb": self._seg_emb,
+            "segvec": getattr(self, "_segvec", None),
         }, path)
 
     @classmethod
@@ -242,6 +249,7 @@ class LivingKVRunner:
         r._coldK, r._coldV = d["coldK"], d["coldV"]
         r._coldKs, r._coldVs = d["coldKs"], d["coldVs"]
         r._mean, r._Vpc, r._seg_emb = d["mean"], d["Vpc"], d["seg_emb"]
+        if d.get("segvec") is not None: r._segvec = d["segvec"]
         return r
 
     def cold_store_gb(self):
