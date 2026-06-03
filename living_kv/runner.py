@@ -213,6 +213,37 @@ class LivingKVRunner:
         prob = float(torch.softmax(logits, -1)[aid])
         return rank, prob, best_seg
 
+    # ---- persistence: cache as memory ----
+    # Prefill once (e.g. over a wiki), save the cold store + catalog, reload next session and skip prefill.
+    # The cache is SPECIFIC to this model + quantization + layer count; it is not portable across models.
+    def save(self, path):
+        torch.save({
+            "version": 1,
+            "model_name": getattr(self.model.config, "_name_or_path", "?"),
+            "NL": self.NL, "NKV": self.NKV, "HD": self.HD, "hidden": self.hidden,
+            "N": self.N, "segments": self.segments,
+            "config": dict(win=self.win, budget=self.budget, recency=self.recency,
+                           lmid=self.lmid, remove_pc=self.remove_pc, bits=self.bits),
+            "coldK": self._coldK, "coldV": self._coldV,
+            "coldKs": self._coldKs, "coldVs": self._coldVs,
+            "mean": self._mean, "Vpc": self._Vpc, "seg_emb": self._seg_emb,
+        }, path)
+
+    @classmethod
+    def load(cls, path, model, tokenizer, device="cuda"):
+        d = torch.load(path, map_location="cpu", weights_only=False)
+        c = d["config"]
+        r = cls(model, tokenizer, win=c["win"], budget=c["budget"], recency=c["recency"],
+                lmid=c["lmid"], remove_pc=c["remove_pc"], bits=c["bits"], device=device)
+        if r.NL != d["NL"] or r.HD != d["HD"]:
+            raise ValueError(f"cache is for a different model ({d['model_name']}, NL={d['NL']}) — "
+                             f"caches are model+quant specific and not portable")
+        r.N = d["N"]; r.segments = d["segments"]
+        r._coldK, r._coldV = d["coldK"], d["coldV"]
+        r._coldKs, r._coldVs = d["coldKs"], d["coldVs"]
+        r._mean, r._Vpc, r._seg_emb = d["mean"], d["Vpc"], d["seg_emb"]
+        return r
+
     def cold_store_gb(self):
         per = self._coldK[0].element_size()
         n = sum(self._coldK[l].numel() + self._coldV[l].numel() for l in range(self.NL))
