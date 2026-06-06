@@ -631,6 +631,43 @@ static int cmd_ask(const std::string &dir, const std::string &question) {
     return low_conf ? 2 : 0;
 }
 
+// probe (curiosity-loop M5 / drive layer): GPU-free gap SENSOR. Embeds the question (ollama),
+// runs the hybrid probe against the catalog, prints machine-readable scores. NO model load
+// (works on TEXTONLY stores, no MODEL env needed), NO w update — scanning for holes is not
+// usage; the sensor must not recharge what it measures (read-only by design).
+// stdout TSV: sem_top  lex_top  low_conf  top_seg_id  top_seg_snippet
+// exit 0 = topic known, 2 = low confidence (hole in memory).
+static int cmd_probe(const std::string &dir, const std::string &question) {
+    Manifest m; if (!load_manifest(dir, m)) fail("no store at " + dir + " (run: kvmem ingest <dir> <file>)");
+    apply_emb(m);
+    std::vector<CatRow> rows = load_catalog(dir);
+    if ((long)rows.size() != m.n_segments) fail("catalog/manifest mismatch");
+    std::string embraw = read_file(dir+"/embs.f32");
+    if (embraw.size() != rows.size()*EMB_DIM*4) fail("embs.f32 size mismatch");
+    const int SEL = env_i("SEL",3);
+    const double GAP = env_f("GAP",0.04), THRESH = env_f("THRESH",0.65);
+    // batch mode (question == "-"): one question per stdin line, one TSV line each — the store
+    // and the DF cache load once, so a 50-question curiosity scan is seconds, not minutes.
+    auto probe_one = [&](const std::string &q) {
+        float sem_top=0, lex_top=0; bool low_conf=false; std::map<int,float> sem_of;
+        std::vector<int> pick = hybrid_probe(rows, embraw, q, SEL, GAP, THRESH,
+                                             sem_top, lex_top, low_conf, sem_of);
+        std::string snip = utf8_sanitize(rows[pick[0]].text.substr(0, 120)); // substr may cut a multibyte char
+        printf("%.4f\t%.2f\t%d\t%d\t%s\n", sem_top, lex_top, low_conf ? 1 : 0, pick[0], tsv_escape(snip).c_str());
+        fflush(stdout);
+        return low_conf;
+    };
+    if (question == "-") {
+        bool any_low = false; std::string line;
+        for (char buf[8192]; fgets(buf, sizeof buf, stdin); ) {
+            line = buf; while (!line.empty() && (line.back()=='\n' || line.back()=='\r')) line.pop_back();
+            if (!line.empty()) any_low |= probe_one(line);
+        }
+        return any_low ? 2 : 0;
+    }
+    return probe_one(question) ? 2 : 0;
+}
+
 // chat (M2): interactive REPL with living memory. The model loads ONCE; every turn
 // (user line + answer) is committed to the store immediately (KV spill + catalog + embeddings
 // + manifest), so a crash loses nothing and a LATER chat/ask process remembers this one.
@@ -1039,6 +1076,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "kvmem — living-KV session memory (ingest once, ask forever)\n"
                         "  kvmem ingest <store_dir> <text_file>\n"
                         "  kvmem ask    <store_dir> \"question\"\n"
+                        "  kvmem probe  <store_dir> \"question\"   # GPU-free gap sensor: scores only, no generation\n"
                         "  kvmem chat   <store_dir>            # interactive; later sessions remember\n"
                         "  kvmem serve  <store_dir>            # resident model + HTTP /ask /stats (KVPORT=8345)\n"
                         "  kvmem prune  <store_dir> keep=N|below=W  # sink cold segments (text -> archive.tsv)\n"
@@ -1054,6 +1092,7 @@ int main(int argc, char **argv) {
     std::string cmd = argv[1], dir = argv[2];
     if (cmd == "ingest" && argc > 3) return cmd_ingest(dir, argv[3]);
     if (cmd == "ask"    && argc > 3) return cmd_ask(dir, argv[3]);
+    if (cmd == "probe"  && argc > 3) return cmd_probe(dir, argv[3]);
     if (cmd == "chat")               return cmd_chat(dir);
     if (cmd == "serve")              return cmd_serve(dir);
     if (cmd == "prune"  && argc > 3) return cmd_prune(dir, argv[3]);
