@@ -59,13 +59,28 @@ turn present the model trusts the dialogue framing and says the fact "wasn't men
 conversation so continuity and the store stay intact. Verified: with the fix the doc fact is
 recalled verbatim; with `FALLBACK=0` the old "wasn't mentioned" failure reproduces.
 
-**Boundary (what kvmem does *not* do yet):** recall over messy free-form text (e.g. raw chat
-logs) is unreliable. On planted, self-contained facts the probe lands the right segment (cosine
-~0.93) and the answer is grounded. On conversational logs the single-segment nomic cosine ranks
-*topically* related segments (~0.66) rather than the answer-bearing one, and generation then
-confabulates from the model's prior. kvmem today is a **fact store** (notes, configs, structured
-knowledge), not a session-recall engine over arbitrary logs — the latter needs a stronger
-retriever (hybrid probe) and grounded generation.
+## Hybrid probe + extractive answers (logs)
+
+The probe fuses two channels by RRF: **semantic** (nomic cosine) and **lexical** (IDF-weighted
+exact-term overlap over the stored text). Pure semantic ranks *topical* neighbours for rare exact
+terms; the lexical channel lifts the segment that literally contains the term. Verified on a store
+of real chat logs: the lexical channel surfaced the right segment for an exact term (`kvmem`) that
+pure cosine had ranked 0.66/topical.
+
+`EXTRACT=1 kvmem ask <store> "q"` returns the **stored text** of the recalled segments instead of
+generating. This is the honest mode for messy logs: free generation confabulates over real terms
+that collide with the model's prior (e.g. `kvmem` → "virtual memory management", `touch
+calibration` → "xinput_calibrator") *even when the correct segment is retrieved and adjacent* —
+prior-dominance, not a retrieval miss (invented needles like `cobalt-finch` have no competing
+prior and generate verbatim). EXTRACT sidesteps it by quoting what was actually stored.
+
+Low-confidence is judged on the **semantic** channel only (`sem < THRESH`): semantic cosine is
+the "is this topic in memory at all" signal; an incidental rare-word match must not pass an absent
+fact as confident.
+
+**Use it as:** a **fact store** answer well with generation (planted facts, notes, configs); a
+**log store** is reliable with the hybrid probe + `EXTRACT=1` (grounded retrieval), while free
+generation over arbitrary logs remains confabulation-prone.
 
 ## Store layout (`mystore/`)
 
@@ -131,7 +146,8 @@ when defrag genuinely shrinks the store (e.g. 25 195 → 344 tokens after prunin
 
 ## Status
 
-M4 of the session-memory driver: ingest / ask / chat (with ask-fallback) / serve / prune /
-defrag / stats, plus a Hermes skill. Verified as a fact store on Qwen2.5-7B-1M. Not solved:
-recall over free-form logs (see Boundary above — needs a hybrid retriever), OpenAI-style API,
-true 4-bit cold store.
+M5 of the session-memory driver: ingest / ask / chat (ask-fallback) / serve / prune / defrag /
+stats, hybrid probe + `EXTRACT` mode, Hermes skill. Verified on Qwen2.5-7B-1M: a solid fact store
+(generation), and reliable log retrieval via hybrid probe + `EXTRACT`. Open: free generation over
+arbitrary logs (prior-dominance), a self-embedding probe channel, OpenAI-style API, 4-bit cold
+store.

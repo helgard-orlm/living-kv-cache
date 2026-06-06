@@ -32,6 +32,7 @@
 #include <cmath>
 #include <algorithm>
 #include <map>
+#include <set>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <chrono>
@@ -170,6 +171,24 @@ static std::vector<float> embed(const std::string &text, bool query) {
 }
 static float cosine(const float *a, const float *b) {
     double d=0,na=0,nb=0; for (int i=0;i<EMB_DIM;i++){d+=a[i]*b[i];na+=a[i]*a[i];nb+=b[i]*b[i];} return (float)(d/(sqrt(na)*sqrt(nb)+1e-9));
+}
+
+// ---------- lexical channel (M5): exact-term matching, complements nomic's topical semantics ----------
+// nomic ranks topical neighbours for rare exact terms (M4 ISC-4: "kvmem" -> a topical 0.66 miss).
+// A word is a run of ASCII-alnum (lowercased) or high UTF-8 bytes (cyrillic kept as-is, no case-fold
+// — fine for rare terms); length >= 3. Mirrors wikiq's tokenizer/IDF/RRF.
+static std::set<std::string> words_of(const std::string &s) {
+    std::set<std::string> out; std::string cur;
+    auto flush = [&]{ if (cur.size() >= 3) out.insert(cur); cur.clear(); };
+    for (unsigned char c : s) {
+        if (c >= 0x80) cur += (char)c;
+        else if (c >= 'a' && c <= 'z') cur += (char)c;
+        else if (c >= 'A' && c <= 'Z') cur += (char)(c + 32);
+        else if (c >= '0' && c <= '9') cur += (char)c;
+        else flush();
+    }
+    flush();
+    return out;
 }
 
 // ---------- llama ----------
@@ -368,23 +387,77 @@ static int cmd_ingest(const std::string &dir, const std::string &file) {
     return 0;
 }
 
+// hybrid probe (M5): RRF fusion of nomic semantic cosine + lexical IDF-overlap. Catalog-side,
+// no model needed for the lexical channel. Returns picked segment ids (document order), the top
+// semantic cosine + the top lexical score (for honest low-confidence), and per-segment df cached
+// across calls of one resident process. Mirrors wikiq (semantic + IDF, RRF k=60).
+static std::vector<int> hybrid_probe(const std::vector<CatRow> &rows, const std::string &embraw,
+                                     const std::string &question, int SEL, double GAP, double THRESH,
+                                     float &sem_top, float &lex_top, bool &low_conf,
+                                     std::map<int,float> &sem_of) {
+    const int n = (int)rows.size();
+    const float *E = (const float*)embraw.data();
+    // per-segment word sets + document frequency (cached on the rows vector identity is overkill;
+    // recompute — ~900 segments is microseconds)
+    static const std::vector<CatRow> *df_for = nullptr; static std::vector<std::set<std::string>> SEG; static std::map<std::string,int> DF;
+    if (df_for != &rows) {
+        df_for = &rows; SEG.clear(); DF.clear(); SEG.reserve(n);
+        for (auto &r : rows) { SEG.push_back(words_of(r.text)); for (auto &w : SEG.back()) DF[w]++; }
+    }
+    auto qe = embed(question, true);
+    auto qw = words_of(question);
+    std::vector<float> sem(n), lex(n);
+    for (int i = 0; i < n; i++) {
+        sem[i] = cosine(qe.data(), E + i*EMB_DIM);
+        // rare exact terms always count (df<=2, e.g. "kvmem"/"cobalt-finch" regardless of corpus
+        // size); moderately rare via the df<0.2N stopword cut. Keeps the channel alive on tiny stores.
+        double s = 0; for (auto &w : qw) { auto it = DF.find(w); if (it != DF.end() && (it->second <= 2 || it->second < n*0.2)) if (SEG[i].count(w)) s += log((double)n / it->second); }
+        lex[i] = (float)s;
+    }
+    // ranks (0 = best) for each channel
+    std::vector<int> order(n); for (int i=0;i<n;i++) order[i]=i;
+    std::vector<int> rs(n), rl(n);
+    std::sort(order.begin(), order.end(), [&](int a,int b){return sem[a]>sem[b];}); for (int r=0;r<n;r++) rs[order[r]]=r;
+    std::sort(order.begin(), order.end(), [&](int a,int b){return lex[a]>lex[b];}); for (int r=0;r<n;r++) rl[order[r]]=r;
+    std::vector<std::pair<float,int>> fused;
+    for (int i=0;i<n;i++) fused.push_back({1.f/(60+rs[i]) + 1.f/(60+rl[i]), i});
+    std::sort(fused.rbegin(), fused.rend());
+    sem_top = *std::max_element(sem.begin(), sem.end());
+    lex_top = *std::max_element(lex.begin(), lex.end());
+    // confidence-aware selection (poc18f): top-1 always; more only if within GAP·top of the fused top
+    std::vector<int> pick = {fused[0].second};
+    for (int k = 1; k < n && (int)pick.size() < SEL; k++)
+        if (fused[k].first >= fused[0].first * (1.0 - GAP*5)) pick.push_back(fused[k].second);
+    // low-confidence = semantic UNfamiliarity. The lexical channel decides WHICH segment, not
+    // WHETHER we know the topic: a single incidental rare-word match (e.g. "swallow") must NOT
+    // signal confidence (M5 verify: it falsely passed an absent fact). Semantic cosine is the
+    // honest "is this topic in memory at all" signal.
+    low_conf = sem_top < THRESH;
+    for (int i=0;i<n;i++) sem_of[i] = sem[i];
+    fprintf(stderr, "[probe] sem_top %.3f lex_top %.2f | fused top: ", sem_top, lex_top);
+    for (int k=0;k<3 && k<n;k++) fprintf(stderr, "seg%d ", fused[k].second);
+    fprintf(stderr, "| picked %zu%s\n", pick.size(), low_conf ? "  ⚠ LOW CONFIDENCE — likely not in memory" : "");
+    return pick;
+}
+
 // shared by `ask` (one-shot) and `serve` (model stays resident): probe -> restore -> generate.
 // Assumes the model is loaded and the memory is empty. Updates w and writes the catalog back.
 static std::string ask_core(const std::string &dir, Manifest &m, std::vector<CatRow> &rows,
                             const std::string &embraw, const std::string &question, bool &low_conf) {
-    const float *E = (const float*)embraw.data();
     const int SEL=env_i("SEL",3), GEN=env_i("GEN",96); const double GAP=env_f("GAP",0.04), THRESH=env_f("THRESH",0.65), DECAY=env_f("DECAY",0.9);
-    auto q = embed(question, true);
-    std::vector<std::pair<float,int>> scored;
-    for (size_t i = 0; i < rows.size(); i++) scored.push_back({cosine(q.data(), E + i*EMB_DIM), (int)i});
-    std::sort(scored.rbegin(), scored.rend());
-    // confidence-aware selection (poc18f lesson): top-1 always; more only if within GAP of top-1
-    std::vector<int> pick = {scored[0].second};
-    for (int k = 1; k < (int)scored.size() && (int)pick.size() < SEL; k++)
-        if (scored[k].first >= scored[0].first - GAP) pick.push_back(scored[k].second);
-    low_conf = scored[0].first < THRESH;
-    fprintf(stderr, "[ask] probe top: "); for (int k=0;k<3 && k<(int)scored.size();k++) fprintf(stderr, "seg%d(%.3f) ", scored[k].second, scored[k].first);
-    fprintf(stderr, "| picked %zu seg(s)%s\n", pick.size(), low_conf ? "  ⚠ LOW CONFIDENCE — likely not in memory" : "");
+    float sem_top, lex_top; std::map<int,float> score_of;
+    std::vector<int> pick = hybrid_probe(rows, embraw, question, SEL, GAP, THRESH, sem_top, lex_top, low_conf, score_of);
+    std::sort(pick.begin(), pick.end()); // document order reads better than fused order
+
+    // EXTRACT mode (M5): for messy logs, free generation confabulates (wikiq echo-attractor) —
+    // return the stored text of the recalled segments instead. Honest "here's what we had".
+    if (env_i("EXTRACT", 0)) {
+        std::string out;
+        for (int id : pick) { out += rows[id].text; if (out.size() && out.back() != '\n') out += '\n'; }
+        for (auto &r : rows) r.w *= (float)DECAY; for (int id : pick) rows[id].w += score_of[id];
+        save_catalog(dir, rows);
+        return out;
+    }
 
     llama_memory_t mem = llama_get_memory(g_ctx);
     // true attention sink: a BOS token at pos 0 (structural, no content — content-sinks contaminate the answer)
@@ -430,10 +503,9 @@ static std::string ask_core(const std::string &dir, Manifest &m, std::vector<Cat
         lg = decode(&best, 1, pos++, true);
     }
     while (!out.empty() && isspace((unsigned char)out.back())) out.pop_back();
-    // living update: decay all, recharge each genuinely picked segment by its own probe score
-    std::map<int,float> score_of; for (auto &si : scored) score_of[si.second] = si.first;
+    // living update: decay all, recharge each genuinely picked segment by its semantic probe score
     for (auto &r : rows) r.w *= (float)DECAY;
-    for (int id : pick) rows[id].w += score_of[id]; // recharge each genuinely picked segment
+    for (int id : pick) rows[id].w += score_of[id]; // score_of filled by hybrid_probe (semantic cosine)
     save_catalog(dir, rows);
     return out;
 }
@@ -515,25 +587,17 @@ static int cmd_chat(const std::string &dir) {
         if (q.empty()) continue;
         if (q == "/quit" || q == "/exit") break;
 
-        // probe the whole catalog (old sessions + earlier turns of this one)
+        // probe the whole catalog (old sessions + earlier turns of this one) — hybrid (M5)
         std::vector<int> pick; float top = 0.f; std::map<int,float> score_of;
         if (!rows.empty()) {
-            auto qe = embed(q, true);
-            std::vector<std::pair<float,int>> scored;
-            for (size_t i = 0; i < rows.size(); i++) scored.push_back({cosine(qe.data(), (const float*)embraw.data() + i*EMB_DIM), (int)i});
-            std::sort(scored.rbegin(), scored.rend());
-            top = scored[0].first;
-            for (auto &si : scored) score_of[si.second] = si.first;
-            // restore only confident hits that are NOT already live in the window
-            if (top >= THRESH)
-                for (int k = 0; k < (int)scored.size() && (int)pick.size() < SEL; k++) {
-                    if (scored[k].first < top - GAP) break;
-                    if (rows[scored[k].second].hi > live_lo) continue;   // already in live cache
-                    pick.push_back(scored[k].second);
-                }
+            float sem_top, lex_top; bool lc;
+            auto cand = hybrid_probe(rows, embraw, q, SEL, GAP, THRESH, sem_top, lex_top, lc, score_of);
+            top = sem_top;
+            // restore confident hits not already live in the window
+            if (!lc) for (int id : cand) { if (rows[id].hi > live_lo) continue; pick.push_back(id); }
             for (auto &r : rows) r.w *= (float)DECAY;
             for (int id : pick) rows[id].w += score_of[id];
-            fprintf(stderr, "[recall] top %.3f, restored %zu old seg(s)\n", top, pick.size());
+            fprintf(stderr, "[recall] sem %.3f lex %.2f, restored %zu old seg(s)\n", sem_top, lex_top, pick.size());
         }
         // copy-bias source: recalled segments' stored text (used by both paths)
         std::vector<uint8_t> in_copy;
@@ -544,7 +608,7 @@ static int cmd_chat(const std::string &dir) {
 
         std::string out; int turn_lo = (int)m.total_tokens, turn_hi;
         const bool FALLBACK = env_i("FALLBACK", 1) != 0;
-        bool used_fallback = FALLBACK && top >= THRESH && !pick.empty();
+        bool used_fallback = FALLBACK && !pick.empty(); // a confident hit (either channel) was restored
 
         if (used_fallback) {
             // ASK-FALLBACK (M4): the M3 A/B showed the conversational prior overrides injected KV
