@@ -33,17 +33,27 @@ else say "cloning $REPO -> $DIR"; git clone --depth 1 "$REPO" "$DIR"; fi
 cd "$DIR"
 
 # 2. llama.cpp (pinned) + libllama
+build_llama() { # $1 = extra cmake flags ("" = CPU)
+    rm -rf llama.cpp/build
+    cmake -S llama.cpp -B llama.cpp/build $1 -DCMAKE_BUILD_TYPE=Release \
+          -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=OFF >/dev/null \
+    && cmake --build llama.cpp/build -j"$JOBS" --target llama >/dev/null
+}
 if [ ! -f llama.cpp/build/bin/libllama.so ]; then
     [ -d llama.cpp ] || { say "cloning llama.cpp @$LLAMA_TAG"; git clone --depth 1 --branch "$LLAMA_TAG" https://github.com/ggml-org/llama.cpp; }
-    CUDA_FLAG=""
-    if command -v nvcc >/dev/null 2>&1 || [ -x /usr/local/cuda/bin/nvcc ]; then
-        CUDA_FLAG="-DGGML_CUDA=ON"; say "CUDA found -> GPU build"
+    NVCC="$(command -v nvcc 2>/dev/null || true)"
+    [ -z "$NVCC" ] && [ -x /usr/local/cuda/bin/nvcc ] && NVCC=/usr/local/cuda/bin/nvcc
+    if [ -n "$NVCC" ]; then
+        export CUDACXX="$NVCC"   # cmake needs the full path when nvcc is not on PATH
+        say "CUDA found ($NVCC) -> GPU build (-j$JOBS, takes a few minutes)..."
+        if ! build_llama "-DGGML_CUDA=ON"; then
+            say "GPU build failed -> falling back to CPU build..."
+            build_llama ""
+        fi
     else
-        say "no CUDA toolkit -> CPU build (demos work, just slower)"
+        say "no CUDA toolkit -> CPU build (demos work, just slower; -j$JOBS)..."
+        build_llama ""
     fi
-    say "building libllama (-j$JOBS, takes a few minutes)..."
-    cmake -S llama.cpp -B llama.cpp/build $CUDA_FLAG -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=OFF >/dev/null
-    cmake --build llama.cpp/build -j"$JOBS" --target llama >/dev/null
 fi
 LL="$DIR/llama.cpp"
 
