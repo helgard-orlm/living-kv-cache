@@ -17,6 +17,11 @@ VRAM stays **small and constant** no matter how long the context gets — the li
 
 ---
 
+> **New (Jun 2026): [`llamacpp/`](llamacpp/) — the same mechanics ported onto stock llama.cpp** (no kernel
+> fork, public C API only): bit-exact KV cut/restore, streaming 131k tokens through a 32×-smaller buffer,
+> w-dynamics (decay/recharge/eviction/revival), q8_0 cold store, constant ~84 tok/s decode where the full
+> cache OOMs. See [llamacpp/README.md](llamacpp/README.md).
+
 ## The idea in plain words
 
 A transformer writes a "card" (a key/value vector) for every token it reads, and to produce the next token
@@ -61,7 +66,10 @@ not change.
 2. **Confidence decays with length.** The fact stays top-1/top-2, but the model grows less certain
    (p 0.98 at 120k → p 0.21 at 800k).
 3. **Single synthetic needle.** Many *same-type* needles (e.g. 8 "the code for CITY is …" lines) defeat the
-   tiny-budget probe — full attention is needed there. This is a real limitation, not yet solved here.
+   tiny-budget probe — full attention is needed there. This is a real limitation of the *self-embedding*
+   probe in this python PoC. *(Update: in the [llama.cpp port](llamacpp/) an **external text-embedding
+   catalog** finds 8/8 same-type needles — entity names are strong lexical anchors there; restoring more
+   than the single best match can still distract generation, so selection should be confidence-aware.)*
 4. **Windowed prefill.** Late tokens attend only to a `WIN`-token window, so this demonstrates *retrieval of
    a stored fact*, not full bidirectional understanding of the whole context.
 5. **4-bit cold store is NOT lossless** (it degrades recall even at 32k). Use `BITS=8` (lossless recall, ~2×
