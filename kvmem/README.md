@@ -8,6 +8,10 @@ recalls from its own stored KV-cache — no re-reading the source, no RAG re-pre
 kvmem ingest mystore notes.txt          # stream text through a small KV buffer, spill to disk
 kvmem ingest mystore more.txt           # append (positions continue across files)
 kvmem ask    mystore "what's the gate code?"   # fresh process: probe -> restore relevant KV -> answer
+kvmem chat   mystore                     # interactive REPL; every turn is committed to the store,
+                                         # so a LATER chat/ask process remembers this conversation
+kvmem defrag mystore                     # rebuild the store from its stored text; set MODEL=new.gguf
+                                         # to migrate a store to a different model
 kvmem stats  mystore                     # manifest + hottest segments by weight
 ```
 
@@ -28,10 +32,12 @@ the text** — recall, not re-reading. Restore is milliseconds; no re-prefill of
 - **Low-confidence honesty**: a question whose answer isn't in the store is flagged
   `⚠ LOW CONFIDENCE` (top probe score below threshold) and exits non-zero.
 
-**Known soft spot:** exact verbatim recall of a *novel multi-token string* (e.g. an invented
-hostname `cobalt-finch`) can be paraphrased even though the correct segment is retrieved — the recall
-mechanism is solid, the generation's copy-fidelity of rare tokens is not guaranteed. Matches the
-"confidence decays" caveat of the parent PoC.
+**Copy-bias (M2):** exact verbatim recall of a *novel multi-token string* (e.g. an invented
+hostname `cobalt-finch`) used to get paraphrased even though the correct segment was retrieved.
+Generation is greedy, so this is not a sampling issue; the fix is a **copy bias** — tokens that
+occur in the recalled segments' *stored text* get a logit bonus (`COPYB=2.0`), tipping near-ties
+toward verbatim copy. The KV path stays pure: the stored text contributes token IDs only, it is
+never re-prefilled. Verified on the small-model smoke; large-model verification pending.
 
 ## Store layout (`mystore/`)
 
@@ -56,9 +62,27 @@ g++ -O2 -o kvmem kvmem.cpp -I <llama.cpp>/include -I <llama.cpp>/ggml/include \
 ```
 
 Needs ollama with `nomic-embed-text` for the catalog. Env: `MODEL` (gguf path), `KVT=q8_0`,
-`NCTX=4096`, `SEL=3`, `GAP=0.04`, `THRESH=0.65`, `GEN=96`, `DECAY=0.9`.
+`NCTX=4096`, `SEL=3`, `GAP=0.04`, `THRESH=0.65`, `GEN=96`, `DECAY=0.9`, `COPYB=2.0`,
+`EMB_CPU=1` (chat keeps the LLM resident, so nomic embeds on CPU to avoid fighting it for VRAM).
+
+## Chat notes
+
+- The model loads **once** per chat session; each turn (user line + answer) becomes one segment,
+  committed immediately (KV spill + catalog + embedding + manifest) — a crash loses nothing.
+- On startup the tail segment of the store is restored, so the conversation resumes adjacent to
+  existing KV cells (decoding far from any cell in a fresh cache fails — M1 lesson).
+- Recall: each user line probes the whole catalog; confident hits that are not already in the
+  live window are restored before answering and dropped from the live window after (disk keeps them).
+- The live window is capped at `NCTX/2`; older turns are evicted from the cache (already on disk).
+
+## Defrag / migration
+
+`defrag` re-decodes every segment's stored text with the **current** `MODEL` into a fresh store
+(`<store>.new`), carries the living weights over, copies the embeddings (they depend only on the
+text), then atomically swaps; the old store stays at `<store>.bak`. This is the escape hatch for
+all three KV locks: model change, quant change, llama.cpp build change.
 
 ## Status
 
-M1 (ingest-first) of the session-memory driver. Not yet: interactive chat daemon, defrag/migration
-when the model changes, true 4-bit cold store. PoC quality — see the soft spot above.
+M2 of the session-memory driver: ingest/ask/chat/defrag/stats. Not yet: daemon API, true 4-bit
+cold store, pruning (which would make defrag genuinely compact the store).

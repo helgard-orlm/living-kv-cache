@@ -8,6 +8,10 @@
 //                                          # every segment + catalog + source text to disk
 //   kvmem ask    <store_dir> "question"    # fresh process: probe catalog -> restore only the
 //                                          # relevant segments -> generate the answer
+//   kvmem chat   <store_dir>               # interactive REPL: every turn is appended to the
+//                                          # store; a later chat process remembers this one
+//   kvmem defrag <store_dir>               # rebuild store from the stored text (compact
+//                                          # positions; set MODEL=... to migrate to a new model)
 //   kvmem stats  <store_dir>               # manifest + hottest segments by w
 //
 // Store layout (no JSON libs — line/TSV formats):
@@ -17,7 +21,8 @@
 //   segments/N.kv   serialized KV range (llama_state_seq format; build-sensitive, hence manifest)
 //
 // Env: MODEL (gguf path), NCTX=4096, CHUNK=512, WIN=256, GEN=96, KVT=q8_0,
-//      SEL=3 (max segments), GAP=0.04 (confidence window below top-1), THRESH=0.50 (low-confidence warn)
+//      SEL=3 (max segments), GAP=0.04 (confidence window below top-1), THRESH=0.65 (low-confidence warn),
+//      COPYB=2.0 (copy-bias: logit bonus for tokens present in the recalled segments' stored text)
 #include "llama.h"
 #include <cstdio>
 #include <cstdlib>
@@ -30,6 +35,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <chrono>
+#include <cctype>
 
 static const int EMB_DIM = 768; // nomic-embed-text
 
@@ -81,11 +87,21 @@ static void save_manifest(const std::string &dir, const Manifest &m) {
     write_file(mpath(dir), buf, n);
 }
 static std::vector<CatRow> load_catalog(const std::string &dir) {
+    // manual tab-split — sscanf's literal '\t' eats ANY whitespace and silently strips the
+    // text's leading space, drifting stored text away from what the KV was built on
     std::vector<CatRow> rows; FILE *f = fopen((dir+"/catalog.tsv").c_str(), "r"); if (!f) return rows;
     char *line = nullptr; size_t cap = 0; ssize_t len;
     while ((len = getline(&line, &cap, f)) > 0) {
-        CatRow r; char txt[1 << 15] = {0};
-        if (sscanf(line, "%d\t%d\t%d\t%f\t%32766[^\n]", &r.id, &r.lo, &r.hi, &r.w, txt) >= 4) { r.text = tsv_unescape(txt); rows.push_back(r); }
+        std::string s(line, len); while (!s.empty() && (s.back()=='\n'||s.back()=='\r')) s.pop_back();
+        size_t p = 0, f4[4];
+        bool ok = true;
+        for (int k = 0; k < 4; k++) { f4[k] = s.find('\t', p); if (f4[k] == std::string::npos) { ok = false; break; } p = f4[k]+1; }
+        if (!ok) continue;
+        CatRow r;
+        r.id = atoi(s.c_str());            r.lo = atoi(s.c_str()+f4[0]+1);
+        r.hi = atoi(s.c_str()+f4[1]+1);    r.w  = (float)atof(s.c_str()+f4[2]+1);
+        r.text = tsv_unescape(s.substr(f4[3]+1));
+        rows.push_back(r);
     }
     free(line); fclose(f); return rows;
 }
@@ -118,6 +134,7 @@ static std::string json_escape(const std::string &s) { // full escaping — real
     }
     return o;
 }
+static bool g_emb_cpu = false; // chat keeps the 7B resident -> force nomic onto CPU (274MB, ms-fast)
 static std::vector<float> embed(const std::string &text, bool query) {
     static std::map<std::string, std::vector<float>> cache;
     auto key = (query ? "q:" : "d:") + text;
@@ -125,7 +142,8 @@ static std::vector<float> embed(const std::string &text, bool query) {
     // payload goes through a temp file — never through shell quoting (real text breaks '...')
     std::string clean = utf8_sanitize(text);
     if (clean.size() > 6000) clean = utf8_sanitize(clean.substr(0, 6000)); // belt: nomic ctx is finite
-    std::string payload = std::string("{\"model\":\"nomic-embed-text\",\"prompt\":\"")
+    std::string payload = std::string("{\"model\":\"nomic-embed-text\",")
+        + (g_emb_cpu ? "\"options\":{\"num_gpu\":0}," : "") + "\"prompt\":\""
         + (query ? "search_query: " : "search_document: ") + json_escape(clean) + "\"}";
     char tmpl[] = "/tmp/kvmem_emb_XXXXXX"; int fd = mkstemp(tmpl);
     if (fd < 0) fail("mkstemp failed");
@@ -234,40 +252,13 @@ static void restore_buf(llama_memory_t mem, const std::vector<uint8_t> &buf) {
     llama_memory_seq_rm(mem, 1, -1, -1);
 }
 
-// ---------- commands ----------
-static int cmd_ingest(const std::string &dir, const std::string &file) {
-    const std::string model = env_s("MODEL", "models/Qwen2.5-7B-Instruct-1M-Q4_K_M.gguf");
-    const std::string kvt = env_s("KVT", "q8_0");
-    const int NCTX=env_i("NCTX",4096), CHUNK=env_i("CHUNK",512), WIN=env_i("WIN",256), CAP=env_i("SEGCAP",200);
-    struct stat st;
-    mkdir(dir.c_str(), 0755); mkdir((dir+"/segments").c_str(), 0755);
-    Manifest m; bool existed = load_manifest(dir, m);
-    if (stat(model.c_str(), &st)) fail("model not found: " + model);
-    std::string mbase = model.substr(model.find_last_of('/')+1);
-    if (existed && (m.model_file != mbase || m.model_bytes != (long)st.st_size))
-        fail("store was built with model '"+m.model_file+"' — refusing to mix models in one store");
-    if (existed && m.kv_type != kvt) fail("store kv_type="+m.kv_type+" but KVT="+kvt);
-    if (!existed) { m.model_file=mbase; m.model_bytes=st.st_size; m.kv_type=kvt; m.build=env_s("KVMEM_BUILD","b9297"); }
-
-    load_model(model, NCTX, CHUNK, kvt);
+// ---------- streaming prefill with spill (poc18c) — shared by ingest/defrag/chat ----------
+// rows carry absolute [lo,hi) spans; ids is the matching token stream starting at base.
+// EOF flushes everything including the tail window. Returns wall seconds.
+static double prefill_spill(const std::string &dir, const std::vector<CatRow> &rows,
+                            const std::vector<llama_token> &ids, int base, int CHUNK, int WIN) {
     llama_memory_t mem = llama_get_memory(g_ctx);
-    std::string raw = read_file(file);
-    auto seg_texts = segment_text(raw, CAP);
-    if (seg_texts.empty()) fail("no text segments found in " + file);
-    fprintf(stderr, "[ingest] %s: %zu segments, base pos %ld\n", file.c_str(), seg_texts.size(), m.total_tokens);
-
-    // token stream + absolute spans
-    std::vector<llama_token> ids; std::vector<CatRow> rows;
-    for (size_t s = 0; s < seg_texts.size(); s++) {
-        auto tk = tokenize(seg_texts[s], m.total_tokens==0 && s==0);
-        CatRow r; r.id = (int)(m.n_segments + s); r.lo = (int)(m.total_tokens + ids.size());
-        ids.insert(ids.end(), tk.begin(), tk.end());
-        r.hi = (int)(m.total_tokens + ids.size()); r.w = 0.f; r.text = seg_texts[s];
-        rows.push_back(r);
-    }
-    const int base = (int)m.total_tokens, N = (int)ids.size();
-
-    // streaming prefill with spill (poc18c), EOF flushes everything incl. the tail window
+    const int N = (int)ids.size();
     auto t0 = std::chrono::steady_clock::now();
     size_t next_spill = 0; int kept_from = base;
     auto spill_upto = [&](int cutoff) {
@@ -285,7 +276,42 @@ static int cmd_ingest(const std::string &dir, const std::string &file) {
         spill_upto(base + e - WIN);
     }
     spill_upto(base + N);
-    double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// ---------- commands ----------
+static int cmd_ingest(const std::string &dir, const std::string &file) {
+    const std::string model = env_s("MODEL", "models/Qwen2.5-7B-Instruct-1M-Q4_K_M.gguf");
+    const std::string kvt = env_s("KVT", "q8_0");
+    const int NCTX=env_i("NCTX",4096), CHUNK=env_i("CHUNK",512), WIN=env_i("WIN",256), CAP=env_i("SEGCAP",200);
+    struct stat st;
+    mkdir(dir.c_str(), 0755); mkdir((dir+"/segments").c_str(), 0755);
+    Manifest m; bool existed = load_manifest(dir, m);
+    if (stat(model.c_str(), &st)) fail("model not found: " + model);
+    std::string mbase = model.substr(model.find_last_of('/')+1);
+    if (existed && (m.model_file != mbase || m.model_bytes != (long)st.st_size))
+        fail("store was built with model '"+m.model_file+"' — refusing to mix models in one store");
+    if (existed && m.kv_type != kvt) fail("store kv_type="+m.kv_type+" but KVT="+kvt);
+    if (!existed) { m.model_file=mbase; m.model_bytes=st.st_size; m.kv_type=kvt; m.build=env_s("KVMEM_BUILD","b9297"); }
+
+    load_model(model, NCTX, CHUNK, kvt);
+    std::string raw = read_file(file);
+    auto seg_texts = segment_text(raw, CAP);
+    if (seg_texts.empty()) fail("no text segments found in " + file);
+    fprintf(stderr, "[ingest] %s: %zu segments, base pos %ld\n", file.c_str(), seg_texts.size(), m.total_tokens);
+
+    // token stream + absolute spans
+    std::vector<llama_token> ids; std::vector<CatRow> rows;
+    for (size_t s = 0; s < seg_texts.size(); s++) {
+        auto tk = tokenize(seg_texts[s], m.total_tokens==0 && s==0);
+        CatRow r; r.id = (int)(m.n_segments + s); r.lo = (int)(m.total_tokens + ids.size());
+        ids.insert(ids.end(), tk.begin(), tk.end());
+        r.hi = (int)(m.total_tokens + ids.size()); r.w = 0.f; r.text = seg_texts[s];
+        rows.push_back(r);
+    }
+    const int base = (int)m.total_tokens, N = (int)ids.size();
+
+    double secs = prefill_spill(dir, rows, ids, base, CHUNK, WIN);
     llama_free(g_ctx); llama_model_free(g_model); g_ctx = nullptr; // free VRAM BEFORE embeddings —
     // ollama needs GPU room to load nomic; with the 7B resident it gets CUDA-OOM and returns 500
 
@@ -346,16 +372,33 @@ static int cmd_ask(const std::string &dir, const std::string &question) {
     float *lg = decode(qids.data(), (int)qids.size(), (llama_pos)maxhi, true);
     const int nv = llama_vocab_n_tokens(g_vocab);
     llama_token eos = llama_vocab_eos(g_vocab);
+    // copy-bias (M2): tokens that occur in the recalled segments' STORED TEXT get a logit bonus.
+    // Greedy alone paraphrases rare/invented multi-token strings (M1: cobalt-finch -> "backup-server-
+    // observatory"); the bonus tips near-ties toward verbatim copy. KV path stays pure — the text is
+    // already in the catalog, we only read token IDs from it, never re-prefill it.
+    const float COPYB = (float)env_f("COPYB", 2.0);
+    std::vector<uint8_t> in_copy;
+    if (COPYB > 0) {
+        in_copy.assign(nv, 0);
+        for (int id : pick) for (auto t : tokenize(rows[id].text, false)) if (t >= 0 && t < nv) in_copy[t] = 1;
+    }
     std::string out; llama_pos pos = (llama_pos)maxhi + (llama_pos)qids.size();
+    int ws_run = 0; // copy-bias boosts the space token -> "\n \n \n" never matches "\n\n"; count ws-only pieces instead
     for (int g = 0; g < GEN; g++) {
-        llama_token best = 0; float bv = lg[0];
-        for (int i = 1; i < nv; i++) if (lg[i] > bv) { bv = lg[i]; best = i; }
+        llama_token best = 0; float bv = -1e30f;
+        for (int i = 0; i < nv; i++) {
+            float v = lg[i] + (!in_copy.empty() && in_copy[i] ? COPYB : 0.f);
+            if (v > bv) { bv = v; best = i; }
+        }
         if (best == eos) break;
         char piece[128]; int pn = llama_token_to_piece(g_vocab, best, piece, sizeof piece, 0, false);
-        if (pn > 0) out.append(piece, pn);
-        if (out.size() > 2 && out.find("\n\n") != std::string::npos) break;
+        std::string ps = pn > 0 ? std::string(piece, pn) : "";
+        ws_run = (ps.find_first_not_of(" \t\n\r") == std::string::npos) ? ws_run + 1 : 0;
+        out += ps;
+        if (out.size() > 2 && (out.find("\n\n") != std::string::npos || ws_run >= 3)) break;
         lg = decode(&best, 1, pos++, true);
     }
+    while (!out.empty() && isspace((unsigned char)out.back())) out.pop_back();
     printf("%s\n", out.c_str());
     // living update: decay all, recharge each genuinely picked segment by its own probe score
     std::map<int,float> score_of; for (auto &si : scored) score_of[si.second] = si.first;
@@ -363,6 +406,196 @@ static int cmd_ask(const std::string &dir, const std::string &question) {
     for (int id : pick) rows[id].w += score_of[id]; // recharge each genuinely picked segment
     save_catalog(dir, rows);
     return low_conf ? 2 : 0;
+}
+
+// chat (M2): interactive REPL with living memory. The model loads ONCE; every turn
+// (user line + answer) is committed to the store immediately (KV spill + catalog + embeddings
+// + manifest), so a crash loses nothing and a LATER chat/ask process remembers this one.
+// Recall: each user line probes the catalog; relevant old segments are restored before
+// answering and removed from the live window after (disk keeps them). Startup restores the
+// tail segment of the store -> the conversation resumes adjacent to existing KV cells
+// (fresh-cache decode far from any cell fails with rc=-1 — M1 lesson #5).
+static int cmd_chat(const std::string &dir) {
+    const std::string model = env_s("MODEL", "models/Qwen2.5-7B-Instruct-1M-Q4_K_M.gguf");
+    struct stat st; if (stat(model.c_str(), &st)) fail("model not found: " + model);
+    std::string mbase = model.substr(model.find_last_of('/')+1);
+    const std::string kvt = env_s("KVT", "q8_0");
+    const int NCTX=env_i("NCTX",4096), GEN=env_i("GEN",192), SEL=env_i("SEL",3);
+    const double GAP=env_f("GAP",0.04), THRESH=env_f("THRESH",0.65), DECAY=env_f("DECAY",0.9);
+    const float COPYB = (float)env_f("COPYB", 2.0);
+    g_emb_cpu = env_i("EMB_CPU", 1) != 0;
+
+    mkdir(dir.c_str(), 0755); mkdir((dir+"/segments").c_str(), 0755);
+    Manifest m; bool existed = load_manifest(dir, m);
+    if (existed && (m.model_file != mbase || m.model_bytes != (long)st.st_size))
+        fail("store was built with model '"+m.model_file+"' — KV is model-locked (kvmem defrag migrates)");
+    if (existed && m.kv_type != kvt) fail("store kv_type="+m.kv_type+" but KVT="+kvt);
+    if (!existed) { m.model_file=mbase; m.model_bytes=st.st_size; m.kv_type=kvt; m.build=env_s("KVMEM_BUILD","b9297"); }
+    auto rows = load_catalog(dir);
+    std::string embraw = existed ? read_file(dir+"/embs.f32") : std::string();
+    if (embraw.size() != rows.size()*EMB_DIM*4) fail("embs.f32 size mismatch");
+
+    load_model(model, NCTX, env_i("CHUNK",512), kvt);
+    llama_memory_t mem = llama_get_memory(g_ctx);
+    const int nv = llama_vocab_n_tokens(g_vocab);
+    llama_token eos = llama_vocab_eos(g_vocab);
+
+    // anchor: BOS sink + the tail segment of the store (resume where we left off);
+    // a fresh store needs neither — the first turn carries its own BOS at pos 0
+    int live_lo = 0;                                   // oldest live cell we still keep in cache
+    if (!rows.empty()) {
+        llama_token bos = llama_vocab_bos(g_vocab); if (bos >= 0) decode(&bos, 1, 0, false);
+        std::string b = read_file(dir+"/segments/"+std::to_string(rows.back().id)+".kv");
+        std::vector<uint8_t> buf(b.begin(), b.end());
+        restore_buf(mem, buf);
+        live_lo = rows.back().lo;
+    }
+    fprintf(stderr, "[chat] %s: %ld tokens, %zu segments. /quit to exit.\n", dir.c_str(), m.total_tokens, rows.size());
+
+    char *line = nullptr; size_t lcap = 0;
+    while (true) {
+        fprintf(stderr, "you> "); fflush(stderr);
+        ssize_t len = getline(&line, &lcap, stdin);
+        if (len <= 0) break;
+        std::string q(line, len); while (!q.empty() && (q.back()=='\n'||q.back()=='\r')) q.pop_back();
+        if (q.empty()) continue;
+        if (q == "/quit" || q == "/exit") break;
+
+        // probe the whole catalog (old sessions + earlier turns of this one)
+        std::vector<int> pick; float top = 0.f; std::map<int,float> score_of;
+        if (!rows.empty()) {
+            auto qe = embed(q, true);
+            std::vector<std::pair<float,int>> scored;
+            for (size_t i = 0; i < rows.size(); i++) scored.push_back({cosine(qe.data(), (const float*)embraw.data() + i*EMB_DIM), (int)i});
+            std::sort(scored.rbegin(), scored.rend());
+            top = scored[0].first;
+            for (auto &si : scored) score_of[si.second] = si.first;
+            // restore only confident hits that are NOT already live in the window
+            if (top >= THRESH)
+                for (int k = 0; k < (int)scored.size() && (int)pick.size() < SEL; k++) {
+                    if (scored[k].first < top - GAP) break;
+                    if (rows[scored[k].second].hi > live_lo) continue;   // already in live cache
+                    pick.push_back(scored[k].second);
+                }
+            for (auto &r : rows) r.w *= (float)DECAY;
+            for (int id : pick) rows[id].w += score_of[id];
+            fprintf(stderr, "[recall] top %.3f, restored %zu old seg(s)\n", top, pick.size());
+        }
+        for (int id : pick) {
+            std::string b = read_file(dir+"/segments/"+std::to_string(rows[id].id)+".kv");
+            std::vector<uint8_t> buf(b.begin(), b.end());
+            restore_buf(mem, buf);
+        }
+        // copy-bias source: recalled segments' stored text
+        std::vector<uint8_t> in_copy;
+        if (COPYB > 0 && !pick.empty()) {
+            in_copy.assign(nv, 0);
+            for (int id : pick) for (auto t : tokenize(rows[id].text, false)) if (t >= 0 && t < nv) in_copy[t] = 1;
+        }
+
+        // decode the turn at the live head; generated tokens land in the live cache too
+        std::string turn = "\nUser: " + q + "\nAssistant:";
+        auto tids = tokenize(turn, m.total_tokens == 0);
+        int turn_lo = (int)m.total_tokens;
+        float *lg = decode(tids.data(), (int)tids.size(), (llama_pos)turn_lo, true);
+        llama_pos pos = (llama_pos)turn_lo + (llama_pos)tids.size();
+        // invariant: every char appended to `out` corresponds to a token DECODED into the live
+        // cache — the committed segment text must match its KV span exactly (no drift)
+        std::string out; int ws_run = 0;
+        for (int g = 0; g < GEN; g++) {
+            llama_token best = 0; float bv = -1e30f;
+            for (int i = 0; i < nv; i++) {
+                float v = lg[i] + (!in_copy.empty() && in_copy[i] ? COPYB : 0.f);
+                if (v > bv) { bv = v; best = i; }
+            }
+            if (best == eos) break;
+            char piece[128]; int pn = llama_token_to_piece(g_vocab, best, piece, sizeof piece, 0, false);
+            std::string ps = pn > 0 ? std::string(piece, pn) : "";
+            if (out.size() > 2 && (out + ps).find("\nUser:") != std::string::npos) break; // rejected, not decoded
+            lg = decode(&best, 1, pos++, true);
+            out += ps; printf("%s", ps.c_str()); fflush(stdout);
+            ws_run = (ps.find_first_not_of(" \t\n\r") == std::string::npos) ? ws_run + 1 : 0;
+            if (out.size() > 2 && (out.find("\n\n") != std::string::npos || ws_run >= 3)) break;
+        }
+        printf("\n");
+        // drop recalled old segments from the live window (disk keeps them)
+        for (int id : pick) llama_memory_seq_rm(mem, 0, rows[id].lo, rows[id].hi);
+
+        // commit the turn: one segment = user line + answer (crash-safe, every turn)
+        int turn_hi = (int)pos;
+        auto buf = spill_range(mem, turn_lo, turn_hi);
+        CatRow r; r.id = (int)m.n_segments; r.lo = turn_lo; r.hi = turn_hi; r.w = 0.f;
+        r.text = turn + out;
+        write_file(dir+"/segments/"+std::to_string(r.id)+".kv", buf.data(), buf.size());
+        auto e = embed(r.text, false);
+        write_file(dir+"/embs.f32", e.data(), EMB_DIM*4, "ab");
+        embraw.append((const char*)e.data(), EMB_DIM*4);
+        { FILE *f = fopen((dir+"/catalog.tsv").c_str(), "a"); if (!f) fail("catalog write");
+          fprintf(f, "%d\t%d\t%d\t%.5f\t%s\n", r.id, r.lo, r.hi, r.w, tsv_escape(r.text).c_str()); fclose(f); }
+        rows.push_back(r);
+        m.total_tokens = turn_hi; m.n_segments++;
+        save_manifest(dir, m);
+
+        // live-window budget: evict oldest live segments once the window outgrows ~NCTX/2
+        while (m.total_tokens - live_lo > NCTX/2 && !rows.empty()) {
+            for (auto &rr : rows) if (rr.lo == live_lo) { llama_memory_seq_rm(mem, 0, rr.lo, rr.hi); live_lo = rr.hi; goto evicted; }
+            break; evicted:;
+        }
+    }
+    free(line);
+    save_catalog(dir, rows); // persist w updates
+    fprintf(stderr, "[chat] saved: %ld tokens, %ld segments\n", m.total_tokens, m.n_segments);
+    return 0;
+}
+
+// defrag (M2): rebuild the store from the STORED TEXT — positions restart at 0 (cures the
+// monotonic-position ceiling) and the rebuild runs on the CURRENT MODEL (cures model-lock:
+// set MODEL=new.gguf to migrate). nomic embeddings are model-independent -> embs.f32 is
+// copied as-is, no ollama needed. Atomic: build in <dir>.new, swap via rename, old -> .bak.
+static int cmd_defrag(const std::string &dir) {
+    Manifest mold; if (!load_manifest(dir, mold)) fail("no store at " + dir);
+    auto old_rows = load_catalog(dir);
+    if ((long)old_rows.size() != mold.n_segments) fail("catalog/manifest mismatch");
+    const std::string model = env_s("MODEL", "models/Qwen2.5-7B-Instruct-1M-Q4_K_M.gguf");
+    const std::string kvt = env_s("KVT", mold.kv_type.c_str());
+    const int NCTX=env_i("NCTX",4096), CHUNK=env_i("CHUNK",512), WIN=env_i("WIN",256);
+    struct stat st; if (stat(model.c_str(), &st)) fail("model not found: " + model);
+
+    std::string ndir = dir + ".new", bdir = dir + ".bak";
+    if (!stat(ndir.c_str(), &st)) fail(ndir + " exists — remove it first");
+    struct stat stb; if (!stat(bdir.c_str(), &stb)) fail(bdir + " exists (previous defrag backup) — remove it first");
+    mkdir(ndir.c_str(), 0755); mkdir((ndir+"/segments").c_str(), 0755);
+
+    load_model(model, NCTX, CHUNK, kvt);
+    // same segments, same order, compact positions from 0
+    std::vector<llama_token> ids; std::vector<CatRow> rows;
+    for (size_t s = 0; s < old_rows.size(); s++) {
+        auto tk = tokenize(old_rows[s].text, s == 0);
+        CatRow r; r.id = (int)s; r.lo = (int)ids.size();
+        ids.insert(ids.end(), tk.begin(), tk.end());
+        r.hi = (int)ids.size(); r.w = old_rows[s].w; r.text = old_rows[s].text; // w carries over
+        rows.push_back(r);
+    }
+    fprintf(stderr, "[defrag] %zu segments: %ld tokens -> %zu (model %s)\n",
+            rows.size(), mold.total_tokens, ids.size(), model.c_str());
+    double secs = prefill_spill(ndir, rows, ids, 0, CHUNK, WIN);
+    llama_free(g_ctx); llama_model_free(g_model); g_ctx = nullptr;
+
+    // embeddings depend only on text (unchanged) -> straight copy
+    std::string embraw = read_file(dir + "/embs.f32");
+    write_file(ndir + "/embs.f32", embraw.data(), embraw.size());
+    save_catalog(ndir, rows);
+    struct stat stm; stat(model.c_str(), &stm);
+    Manifest m; m.model_file = model.substr(model.find_last_of('/')+1); m.model_bytes = stm.st_size;
+    m.kv_type = kvt; m.build = env_s("KVMEM_BUILD", "b9297");
+    m.total_tokens = (long)ids.size(); m.n_segments = (long)rows.size();
+    save_manifest(ndir, m);
+
+    if (rename(dir.c_str(), bdir.c_str())) fail("swap failed: cannot move " + dir + " aside");
+    if (rename(ndir.c_str(), dir.c_str())) { rename(bdir.c_str(), dir.c_str()); fail("swap failed: rollback done"); }
+    fprintf(stderr, "[defrag] done in %.1fs: %ld -> %ld tokens, old store kept at %s\n",
+            secs, mold.total_tokens, m.total_tokens, bdir.c_str());
+    return 0;
 }
 
 static int cmd_stats(const std::string &dir) {
@@ -384,14 +617,18 @@ int main(int argc, char **argv) {
         fprintf(stderr, "kvmem — living-KV session memory (ingest once, ask forever)\n"
                         "  kvmem ingest <store_dir> <text_file>\n"
                         "  kvmem ask    <store_dir> \"question\"\n"
+                        "  kvmem chat   <store_dir>            # interactive; later sessions remember\n"
+                        "  kvmem defrag <store_dir>            # rebuild from stored text (MODEL=... migrates)\n"
                         "  kvmem stats  <store_dir>\n"
-                        "env: MODEL=<gguf> KVT=q8_0 NCTX=4096 SEL=3 GAP=0.04 THRESH=0.50 GEN=96\n");
+                        "env: MODEL=<gguf> KVT=q8_0 NCTX=4096 SEL=3 GAP=0.04 THRESH=0.65 GEN=96 COPYB=2.0\n");
         return 1;
     }
     llama_log_set([](ggml_log_level l, const char *t, void*){ if (l >= GGML_LOG_LEVEL_ERROR) fputs(t, stderr); }, nullptr);
     std::string cmd = argv[1], dir = argv[2];
     if (cmd == "ingest" && argc > 3) return cmd_ingest(dir, argv[3]);
     if (cmd == "ask"    && argc > 3) return cmd_ask(dir, argv[3]);
+    if (cmd == "chat")               return cmd_chat(dir);
+    if (cmd == "defrag")             return cmd_defrag(dir);
     if (cmd == "stats")              return cmd_stats(dir);
     fprintf(stderr, "kvmem: bad arguments\n"); return 1;
 }
