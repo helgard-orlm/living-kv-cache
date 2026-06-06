@@ -181,7 +181,9 @@ class LivingKVRunner:
             x = x - (x @ self._Vpc) @ self._Vpc.T
         return F.normalize(x, dim=-1)
 
-    def _probe(self, question):
+    def semantic_scores(self, question):
+        """Per-segment semantic score (self-embedding probe). Exposed so callers can fuse with
+        e.g. lexical scores (RRF) — semantic alone is topical and misses needle-strings."""
         qids = self.tok.encode(question, add_special_tokens=False)
         self._mode = "probe"
         with torch.no_grad():
@@ -189,14 +191,26 @@ class LivingKVRunner:
                             position_ids=torch.arange(len(qids), device=self.dev)[None],
                             use_cache=False, output_hidden_states=True)
         qe = self._deanis(oo.hidden_states[self.lmid][0, -1:].float().cpu())[0]
-        ss = self._seg_emb @ qe
+        return self._seg_emb @ qe
+
+    def _probe(self, question):
+        qids = self.tok.encode(question, add_special_tokens=False)
+        ss = self.semantic_scores(question)
         tokscore = torch.full((self.N,), -1e9)
         for s, (lo, hi) in enumerate(self.segments):
             tokscore[lo:hi] = ss[s]
         return qids, tokscore, int(ss.argmax())
 
-    def answer(self, question, answer_token_str):
-        qids, tokscore, best_seg = self._probe(question)
+    def answer(self, question, answer_token_str, seg_scores=None):
+        if seg_scores is not None:  # external (e.g. hybrid-fused) per-segment scores
+            qids = self.tok.encode(question, add_special_tokens=False)
+            sst = torch.as_tensor(seg_scores, dtype=torch.float32)
+            tokscore = torch.full((self.N,), -1e9)
+            for s, (lo, hi) in enumerate(self.segments):
+                tokscore[lo:hi] = sst[s]
+            best_seg = int(sst.argmax())
+        else:
+            qids, tokscore, best_seg = self._probe(question)
         order = torch.argsort(tokscore, descending=True)
         hot = sorted(set(order[:self.budget - self.recency].tolist()
                          + list(range(self.N - self.recency, self.N))))
@@ -214,6 +228,7 @@ class LivingKVRunner:
                            position_ids=torch.arange(self.N, self.N + len(qids), device=self.dev)[None],
                            use_cache=False)
         logits = o.logits[0, -1].float()
+        self.last_logits = logits  # for caller-side diagnostics (top-k predictions)
         aid = self.tok.encode(answer_token_str, add_special_tokens=False)[0]
         rank = int((torch.argsort(logits, descending=True) == aid).nonzero()[0, 0])
         prob = float(torch.softmax(logits, -1)[aid])
