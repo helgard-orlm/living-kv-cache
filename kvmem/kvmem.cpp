@@ -193,16 +193,40 @@ static std::vector<llama_token> tokenize(const std::string &t, bool add_special)
     if (n > 0) llama_tokenize(g_vocab, t.c_str(), (int)t.size(), out.data(), n, add_special, false);
     return out;
 }
-static float *decode(const llama_token *toks, int n, llama_pos pos0, bool want_logits) {
+static float *decode_seq(const llama_token *toks, int n, llama_pos pos0, bool want_logits, int seq) {
     llama_batch b = llama_batch_init(n, 0, 1);
     for (int i = 0; i < n; i++) {
-        b.token[b.n_tokens]=toks[i]; b.pos[b.n_tokens]=pos0+i; b.n_seq_id[b.n_tokens]=1; b.seq_id[b.n_tokens][0]=0;
+        b.token[b.n_tokens]=toks[i]; b.pos[b.n_tokens]=pos0+i; b.n_seq_id[b.n_tokens]=1; b.seq_id[b.n_tokens][0]=seq;
         b.logits[b.n_tokens]=(want_logits && i==n-1)?1:0; b.n_tokens++;
     }
     int drc = llama_decode(g_ctx, b);
     if (drc) fail("decode failed rc=" + std::to_string(drc) + " (n_tokens=" + std::to_string(n) + " pos0=" + std::to_string((long)pos0) + ")");
     float *lg = want_logits ? llama_get_logits_ith(g_ctx, b.n_tokens-1) : nullptr;
     llama_batch_free(b); return lg;
+}
+static float *decode(const llama_token *toks, int n, llama_pos pos0, bool want_logits) {
+    return decode_seq(toks, n, pos0, want_logits, 0);
+}
+// greedy generation with copy-bias + stop conditions, in sequence `seq`. `lg0` = logits for the
+// first step (already decoded). Returns the generated text. Used by chat's ask-fallback path.
+static std::string gen_loop(float *lg, llama_pos pos, int seq, int GEN,
+                            const std::vector<uint8_t> &in_copy, float COPYB) {
+    const int nv = llama_vocab_n_tokens(g_vocab);
+    llama_token eos = llama_vocab_eos(g_vocab);
+    std::string out; int ws_run = 0;
+    for (int g = 0; g < GEN; g++) {
+        llama_token best = 0; float bv = -1e30f;
+        for (int i = 0; i < nv; i++) { float v = lg[i] + (!in_copy.empty() && in_copy[i] ? COPYB : 0.f); if (v > bv) { bv = v; best = i; } }
+        if (best == eos) break;
+        char piece[128]; int pn = llama_token_to_piece(g_vocab, best, piece, sizeof piece, 0, false);
+        std::string ps = pn > 0 ? std::string(piece, pn) : "";
+        lg = decode_seq(&best, 1, pos++, true, seq);
+        out += ps;
+        ws_run = (ps.find_first_not_of(" \t\n\r") == std::string::npos) ? ws_run + 1 : 0;
+        if (out.size() > 2 && (out.find("\n\n") != std::string::npos || ws_run >= 3)) break;
+    }
+    while (!out.empty() && isspace((unsigned char)out.back())) out.pop_back();
+    return out;
 }
 
 // ---------- segmentation: paragraphs -> sentences/lines -> hard split, capped by tokens ----------
@@ -253,6 +277,13 @@ static std::vector<uint8_t> spill_range(llama_memory_t mem, int lo, int hi) {
 static void restore_buf(llama_memory_t mem, const std::vector<uint8_t> &buf) {
     if (!llama_state_seq_set_data(g_ctx, buf.data(), buf.size(), 1)) fail("state_seq_set_data failed (store from a different llama.cpp build/model? see manifest.txt)");
     llama_memory_seq_cp(mem, 1, 0, -1, -1);
+    llama_memory_seq_rm(mem, 1, -1, -1);
+}
+// restore a saved KV buffer into an arbitrary sequence (chat ask-fallback uses a scratch seq);
+// seq 1 stays the transfer temp, as in spill/restore above
+static void restore_buf_to(llama_memory_t mem, const std::vector<uint8_t> &buf, int dst) {
+    if (!llama_state_seq_set_data(g_ctx, buf.data(), buf.size(), 1)) fail("state_seq_set_data failed");
+    llama_memory_seq_cp(mem, 1, dst, -1, -1);
     llama_memory_seq_rm(mem, 1, -1, -1);
 }
 
@@ -504,74 +535,93 @@ static int cmd_chat(const std::string &dir) {
             for (int id : pick) rows[id].w += score_of[id];
             fprintf(stderr, "[recall] top %.3f, restored %zu old seg(s)\n", top, pick.size());
         }
-        // RoPE-shift (M3): a restored segment far from the live head gets ignored by attention
-        // (M2 finding: probe hit seg, model said "wasn't mentioned"). Pack restored segments
-        // tightly BELOW the live window via seq_add (llama.cpp K-shift — same machinery as
-        // context shifting), so they sit next to the conversation. Shift is cache-only and
-        // temporary: the store keeps original positions; removal uses the shifted span.
-        const bool KVSHIFT = env_i("KVSHIFT", 1) != 0;
-        std::vector<std::pair<int,int>> restored_spans;
-        if (!pick.empty()) {
-            std::vector<int> order = pick;                 // document order reads better than score order
-            std::sort(order.begin(), order.end(), [&](int a, int b){ return rows[a].lo < rows[b].lo; });
-            int total_len = 0; for (int id : order) total_len += rows[id].hi - rows[id].lo;
-            int place = live_lo - total_len;               // pack [place, live_lo)
-            bool can_shift = KVSHIFT && place >= 1;        // keep pos 0 for the BOS sink
-            for (int id : order) {
-                std::string b = read_file(dir+"/segments/"+std::to_string(rows[id].id)+".kv");
-                std::vector<uint8_t> buf(b.begin(), b.end());
-                restore_buf(mem, buf);
-                int L = rows[id].hi - rows[id].lo;
-                if (can_shift && rows[id].hi != live_lo) { // tail-adjacent needs no shift
-                    llama_memory_seq_add(mem, 0, rows[id].lo, rows[id].hi, place - rows[id].lo);
-                    restored_spans.push_back({place, place + L});
-                } else {
-                    restored_spans.push_back({rows[id].lo, rows[id].hi});
-                }
-                if (can_shift) place += L;
-            }
-        }
-        // copy-bias source: recalled segments' stored text
+        // copy-bias source: recalled segments' stored text (used by both paths)
         std::vector<uint8_t> in_copy;
         if (COPYB > 0 && !pick.empty()) {
             in_copy.assign(nv, 0);
             for (int id : pick) for (auto t : tokenize(rows[id].text, false)) if (t >= 0 && t < nv) in_copy[t] = 1;
         }
 
-        // decode the turn at the live head; generated tokens land in the live cache too
-        std::string turn = "\nUser: " + q + "\nAssistant:";
-        auto tids = tokenize(turn, m.total_tokens == 0);
-        int turn_lo = (int)m.total_tokens;
-        float *lg = decode(tids.data(), (int)tids.size(), (llama_pos)turn_lo, true);
-        llama_pos pos = (llama_pos)turn_lo + (llama_pos)tids.size();
-        // invariant: every char appended to `out` corresponds to a token DECODED into the live
-        // cache — the committed segment text must match its KV span exactly (no drift)
-        std::string out; int ws_run = 0;
-        for (int g = 0; g < GEN; g++) {
-            llama_token best = 0; float bv = -1e30f;
-            for (int i = 0; i < nv; i++) {
-                float v = lg[i] + (!in_copy.empty() && in_copy[i] ? COPYB : 0.f);
-                if (v > bv) { bv = v; best = i; }
+        std::string out; int turn_lo = (int)m.total_tokens, turn_hi;
+        const bool FALLBACK = env_i("FALLBACK", 1) != 0;
+        bool used_fallback = FALLBACK && top >= THRESH && !pick.empty();
+
+        if (used_fallback) {
+            // ASK-FALLBACK (M4): the M3 A/B showed the conversational prior overrides injected KV
+            // when answering doc-recall at the live head. So on a confident doc hit, answer in a
+            // SCRATCH sequence ask-style (BOS + segment + question, no dialogue tail), then teacher-
+            // force the result back into the conversation so continuity + the store stay intact.
+            const int SC = 2;
+            llama_memory_seq_rm(mem, SC, -1, -1);
+            int sp = 0; llama_token bos = llama_vocab_bos(g_vocab);
+            if (bos >= 0) { decode_seq(&bos, 1, 0, false, SC); sp = 1; }   // sink at pos 0
+            std::vector<int> order = pick;
+            std::sort(order.begin(), order.end(), [&](int a, int b){ return rows[a].lo < rows[b].lo; });
+            for (int id : order) {                                          // compact segments right after the sink
+                std::string b = read_file(dir+"/segments/"+std::to_string(rows[id].id)+".kv");
+                std::vector<uint8_t> buf(b.begin(), b.end());
+                restore_buf_to(mem, buf, SC);
+                if (rows[id].lo != sp) llama_memory_seq_add(mem, SC, rows[id].lo, rows[id].hi, sp - rows[id].lo);
+                sp += rows[id].hi - rows[id].lo;
             }
-            if (best == eos) break;
-            char piece[128]; int pn = llama_token_to_piece(g_vocab, best, piece, sizeof piece, 0, false);
-            std::string ps = pn > 0 ? std::string(piece, pn) : "";
-            if (out.size() > 2 && (out + ps).find("\nUser:") != std::string::npos) break; // rejected, not decoded
-            lg = decode(&best, 1, pos++, true);
-            out += ps; printf("%s", ps.c_str()); fflush(stdout);
-            ws_run = (ps.find_first_not_of(" \t\n\r") == std::string::npos) ? ws_run + 1 : 0;
-            if (out.size() > 2 && (out.find("\n\n") != std::string::npos || ws_run >= 3)) break;
+            std::string ap = "\n Question: " + q + "\n Answer:";
+            auto aq = tokenize(ap, false);
+            float *lg = decode_seq(aq.data(), (int)aq.size(), sp, true, SC);
+            out = gen_loop(lg, sp + (int)aq.size(), SC, GEN, in_copy, COPYB);
+            llama_memory_seq_rm(mem, SC, -1, -1);
+            printf(" %s\n", out.c_str());
+            // materialize the turn in the live conversation (seq 0) so the next turn stays coherent
+            std::string turn = "\nUser: " + q + "\nAssistant: " + out;
+            auto tids = tokenize(turn, m.total_tokens == 0);
+            decode(tids.data(), (int)tids.size(), (llama_pos)turn_lo, false);
+            turn_hi = turn_lo + (int)tids.size();
+        } else {
+            // normal conversational turn at the live head; restored segments (if any) are RoPE-
+            // shifted next to the conversation (KVSHIFT) and dropped after the answer
+            const bool KVSHIFT = env_i("KVSHIFT", 1) != 0;
+            std::vector<std::pair<int,int>> restored_spans;
+            if (!pick.empty()) {
+                std::vector<int> order = pick;
+                std::sort(order.begin(), order.end(), [&](int a, int b){ return rows[a].lo < rows[b].lo; });
+                int total_len = 0; for (int id : order) total_len += rows[id].hi - rows[id].lo;
+                int place = live_lo - total_len; bool can_shift = KVSHIFT && place >= 1;
+                for (int id : order) {
+                    std::string b = read_file(dir+"/segments/"+std::to_string(rows[id].id)+".kv");
+                    std::vector<uint8_t> buf(b.begin(), b.end());
+                    restore_buf(mem, buf);
+                    int L = rows[id].hi - rows[id].lo;
+                    if (can_shift && rows[id].hi != live_lo) { llama_memory_seq_add(mem, 0, rows[id].lo, rows[id].hi, place - rows[id].lo); restored_spans.push_back({place, place + L}); }
+                    else restored_spans.push_back({rows[id].lo, rows[id].hi});
+                    if (can_shift) place += L;
+                }
+            }
+            std::string turn = "\nUser: " + q + "\nAssistant:";
+            auto tids = tokenize(turn, m.total_tokens == 0);
+            float *lg = decode(tids.data(), (int)tids.size(), (llama_pos)turn_lo, true);
+            llama_pos pos = (llama_pos)turn_lo + (llama_pos)tids.size();
+            int ws_run = 0; // invariant: every appended char is a DECODED token (text==KV span)
+            for (int g = 0; g < GEN; g++) {
+                llama_token best = 0; float bv = -1e30f;
+                for (int i = 0; i < nv; i++) { float v = lg[i] + (!in_copy.empty() && in_copy[i] ? COPYB : 0.f); if (v > bv) { bv = v; best = i; } }
+                if (best == eos) break;
+                char piece[128]; int pn = llama_token_to_piece(g_vocab, best, piece, sizeof piece, 0, false);
+                std::string ps = pn > 0 ? std::string(piece, pn) : "";
+                if (out.size() > 2 && (out + ps).find("\nUser:") != std::string::npos) break; // rejected, not decoded
+                lg = decode(&best, 1, pos++, true);
+                out += ps; printf("%s", ps.c_str()); fflush(stdout);
+                ws_run = (ps.find_first_not_of(" \t\n\r") == std::string::npos) ? ws_run + 1 : 0;
+                if (out.size() > 2 && (out.find("\n\n") != std::string::npos || ws_run >= 3)) break;
+            }
+            printf("\n");
+            for (auto &sp : restored_spans) llama_memory_seq_rm(mem, 0, sp.first, sp.second);
+            turn_hi = (int)pos;
         }
-        printf("\n");
-        // drop recalled old segments from the live window (disk keeps them) — shifted spans!
-        for (auto &sp : restored_spans) llama_memory_seq_rm(mem, 0, sp.first, sp.second);
 
         // commit the turn: one segment = user line + answer (crash-safe, every turn)
-        int turn_hi = (int)pos;
         auto buf = spill_range(mem, turn_lo, turn_hi);
         int new_id = 0; for (auto &rr : rows) new_id = std::max(new_id, rr.id + 1); // ids sparse after prune
         CatRow r; r.id = new_id; r.lo = turn_lo; r.hi = turn_hi; r.w = 0.f;
-        r.text = turn + out;
+        r.text = (used_fallback ? "\nUser: " + q + "\nAssistant: " + out : "\nUser: " + q + "\nAssistant:" + out);
         write_file(dir+"/segments/"+std::to_string(r.id)+".kv", buf.data(), buf.size());
         auto e = embed(r.text, false);
         write_file(dir+"/embs.f32", e.data(), EMB_DIM*4, "ab");

@@ -49,16 +49,23 @@ answer (`7341`) returned; the probe finds the same segment throughout (embedding
 the text). Cross-session chat memory: a fact told in one `chat` process is recalled verbatim by a
 fresh one.
 
-**Known gap (chat doc-recall):** answering an *ingested-document* fact from inside `chat` is
-weaker than via `ask`. The probe finds and restores the right segment, but a clean A/B test
-(Qwen2.5-7B-1M) showed the cause is **not** distance from the live head — restored segments are
-re-positioned adjacent to the conversation via `llama_memory_seq_add` (`KVSHIFT=1`), and the
-output is bit-identical with the shift on or off. The real driver is the **conversational prior**:
-with no prior turn the model answers from the restored KV correctly; once a previous turn exists
-("Is there anything else?"), it trusts the dialogue framing over the injected segment and says the
-fact "wasn't mentioned". `ask` (no dialogue tail, question decoded next to the segment) does not
-have this problem. Candidate fix (next milestone): fall back to ask-style decoding inside chat on
-a strong probe hit, or splice the segment text into the prompt as explicit context.
+**chat doc-recall (fixed via ask-fallback):** answering an *ingested-document* fact from inside
+`chat` used to fail once the conversation had a prior turn — a clean A/B (Qwen2.5-7B-1M) showed
+the cause was *not* distance from the live head (output was bit-identical with `llama_memory_seq_add`
+re-positioning on or off) but the **conversational prior** overriding the injected KV: with a prior
+turn present the model trusts the dialogue framing and says the fact "wasn't mentioned". The fix
+(`FALLBACK=1`, default): on a confident probe hit, answer in a scratch sequence ask-style
+(BOS + segment + question, no dialogue tail), then teacher-force the result back into the
+conversation so continuity and the store stay intact. Verified: with the fix the doc fact is
+recalled verbatim; with `FALLBACK=0` the old "wasn't mentioned" failure reproduces.
+
+**Boundary (what kvmem does *not* do yet):** recall over messy free-form text (e.g. raw chat
+logs) is unreliable. On planted, self-contained facts the probe lands the right segment (cosine
+~0.93) and the answer is grounded. On conversational logs the single-segment nomic cosine ranks
+*topically* related segments (~0.66) rather than the answer-bearing one, and generation then
+confabulates from the model's prior. kvmem today is a **fact store** (notes, configs, structured
+knowledge), not a session-recall engine over arbitrary logs — the latter needs a stronger
+retriever (hybrid probe) and grounded generation.
 
 ## Store layout (`mystore/`)
 
@@ -124,6 +131,7 @@ when defrag genuinely shrinks the store (e.g. 25 195 → 344 tokens after prunin
 
 ## Status
 
-M3 of the session-memory driver: ingest / ask / chat / serve / prune / defrag / stats, plus a
-Hermes skill. Not yet: ask-fallback for chat doc-recall (see the gap above), OpenAI-style API,
-true 4-bit cold store, auto-ingest of session logs.
+M4 of the session-memory driver: ingest / ask / chat (with ask-fallback) / serve / prune /
+defrag / stats, plus a Hermes skill. Verified as a fact store on Qwen2.5-7B-1M. Not solved:
+recall over free-form logs (see Boundary above — needs a hybrid retriever), OpenAI-style API,
+true 4-bit cold store.
