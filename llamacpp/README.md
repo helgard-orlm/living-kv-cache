@@ -20,7 +20,18 @@ Key prerequisite discovered: `ctx_params.kv_unified = true` (with split KV strea
 | 18f | honest same-type multi-needle (8 needles) | catalog seg-hit 8/8 (python probe was 0/8); SEL=1 → 8/8 rank 0; lesson: restoring a *similar* segment distracts generation → selection must be confidence-aware |
 | 18g | decode bench, budget vs full cache | budget **constant ~84 tok/s @ 32k–131k**; full cache 70→62 tok/s and OOM at 65k+ |
 
-## Build
+## One-command install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/helgard-orlm/living-kv-cache/master/llamacpp/install.sh | bash
+```
+
+Clones llama.cpp (pinned to the tested tag), builds it (CUDA if present, else CPU), builds the demos,
+downloads a small demo model and runs the poc18a smoke test. `FULL=1 bash install.sh` also pulls the
+real Qwen2.5-7B-Instruct-1M model (~4.7 GB). poc18b..g additionally need ollama + `nomic-embed-text`
+for the catalog (the script tells you).
+
+## Build (manual)
 
 ```
 g++ -O2 -o poc18X poc18X_*.cpp -I <llama.cpp>/include -I <llama.cpp>/ggml/include \

@@ -20,7 +20,8 @@ VRAM stays **small and constant** no matter how long the context gets — the li
 > **New (Jun 2026): [`llamacpp/`](llamacpp/) — the same mechanics ported onto stock llama.cpp** (no kernel
 > fork, public C API only): bit-exact KV cut/restore, streaming 131k tokens through a 32×-smaller buffer,
 > w-dynamics (decay/recharge/eviction/revival), q8_0 cold store, constant ~84 tok/s decode where the full
-> cache OOMs. See [llamacpp/README.md](llamacpp/README.md).
+> cache OOMs. See [llamacpp/README.md](llamacpp/README.md). One-command install:
+> `curl -fsSL https://raw.githubusercontent.com/helgard-orlm/living-kv-cache/master/llamacpp/install.sh | bash`
 
 ## The idea in plain words
 
