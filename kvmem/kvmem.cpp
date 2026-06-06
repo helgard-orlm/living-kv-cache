@@ -111,9 +111,17 @@ static std::vector<CatRow> load_catalog(const std::string &dir) {
     free(line); fclose(f); return rows;
 }
 static void save_catalog(const std::string &dir, const std::vector<CatRow> &rows) {
+    // tmp+rename is atomic against crashes but NOT against ENOSPC: an unchecked short write
+    // followed by rename replaces a good catalog with a truncated one (lost the cc catalog
+    // to a full disk on 2026-06-06). Verify every write before renaming over the old file.
     std::string tmp = dir + "/catalog.tsv.tmp"; FILE *f = fopen(tmp.c_str(), "w"); if (!f) fail("cannot write catalog");
-    for (auto &r : rows) fprintf(f, "%d\t%d\t%d\t%.5f\t%s\n", r.id, r.lo, r.hi, r.w, tsv_escape(r.text).c_str());
-    fclose(f); rename(tmp.c_str(), (dir + "/catalog.tsv").c_str());
+    bool bad = false;
+    for (auto &r : rows)
+        if (fprintf(f, "%d\t%d\t%d\t%.5f\t%s\n", r.id, r.lo, r.hi, r.w, tsv_escape(r.text).c_str()) < 0) { bad = true; break; }
+    if (fflush(f) != 0 || ferror(f)) bad = true;
+    if (fclose(f) != 0) bad = true;
+    if (bad) { remove(tmp.c_str()); fail("catalog save failed (disk full?) — old catalog kept"); }
+    if (rename(tmp.c_str(), (dir + "/catalog.tsv").c_str()) != 0) fail("catalog rename failed — old catalog kept");
 }
 
 // ---------- embedder (ollama nomic) ----------
@@ -205,6 +213,15 @@ static void load_model(const std::string &model_path, int nctx, int nbatch, cons
     if (kvt != "f16") { cp.type_k = cp.type_v = (kvt=="q8_0") ? GGML_TYPE_Q8_0 : GGML_TYPE_Q4_0; cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED; }
     g_ctx = llama_init_from_model(g_model, cp);
     if (!g_ctx) fail("context init failed (GPU memory busy?)");
+}
+// tokenizer without weights: for TEXTONLY ingest (catalog+embs only, no KV) the model is needed
+// solely for segmentation token counts — vocab_only loads in ms, no VRAM. g_ctx stays null.
+static void load_vocab_only(const std::string &model_path) {
+    struct stat st; if (stat(model_path.c_str(), &st)) fail("model file not found: " + model_path + " (set MODEL=...)");
+    llama_model_params mp = llama_model_default_params(); mp.vocab_only = true;
+    g_model = llama_model_load_from_file(model_path.c_str(), mp);
+    if (!g_model) fail("vocab load failed: " + model_path);
+    g_vocab = llama_model_get_vocab(g_model);
 }
 static std::vector<llama_token> tokenize(const std::string &t, bool add_special) {
     int n = -llama_tokenize(g_vocab, t.c_str(), (int)t.size(), nullptr, 0, add_special, false);
@@ -353,7 +370,11 @@ static int cmd_ingest(const std::string &dir, const std::string &file) {
     long base_id = 0;
     { auto old = load_catalog(dir); for (auto &o : old) base_id = std::max(base_id, (long)o.id + 1); }
 
-    load_model(model, NCTX, CHUNK, kvt);
+    // TEXTONLY=1 (post-M5): for log stores the honest product is probe+EXTRACT — the KV is never
+    // read (probe = nomic embs + lexical IDF, answer = stored text). Skip prefill entirely:
+    // no GPU, no .kv files (21 GB -> ~MB for the cc store), ~1 s/session instead of ~20.
+    const bool TEXTONLY = env_i("TEXTONLY", 0) != 0;
+    if (TEXTONLY) load_vocab_only(model); else load_model(model, NCTX, CHUNK, kvt);
     std::string raw = read_file(file);
     auto seg_texts = segment_text(raw, CAP);
     if (seg_texts.empty()) fail("no text segments found in " + file);
@@ -370,8 +391,8 @@ static int cmd_ingest(const std::string &dir, const std::string &file) {
     }
     const int base = (int)m.total_tokens, N = (int)ids.size();
 
-    double secs = prefill_spill(dir, rows, ids, base, CHUNK, WIN);
-    llama_free(g_ctx); llama_model_free(g_model); g_ctx = nullptr; // free VRAM BEFORE embeddings —
+    double secs = TEXTONLY ? 0.0 : prefill_spill(dir, rows, ids, base, CHUNK, WIN);
+    if (g_ctx) llama_free(g_ctx); llama_model_free(g_model); g_ctx = nullptr; // free VRAM BEFORE embeddings —
     // ollama needs GPU room to load nomic; with the 7B resident it gets CUDA-OOM and returns 500
 
     // catalog embeddings (memoized per unique text)
@@ -383,7 +404,7 @@ static int cmd_ingest(const std::string &dir, const std::string &file) {
       fclose(f); }
     m.total_tokens = base + N; m.n_segments += (long)rows.size();
     save_manifest(dir, m);
-    fprintf(stderr, "[ingest] done: +%d tokens (%.0f tok/s) -> total %ld tokens, %ld segments\n", N, N/secs, m.total_tokens, m.n_segments);
+    fprintf(stderr, "[ingest] done: +%d tokens (%.0f tok/s) -> total %ld tokens, %ld segments\n", N, secs > 0 ? N/secs : 0.0, m.total_tokens, m.n_segments);
     return 0;
 }
 
@@ -527,7 +548,9 @@ static void open_store(const std::string &dir, Manifest &m, std::vector<CatRow> 
 static int cmd_ask(const std::string &dir, const std::string &question) {
     Manifest m; std::vector<CatRow> rows; std::string embraw, model;
     open_store(dir, m, rows, embraw, model);
-    load_model(model, env_i("NCTX",4096), env_i("CHUNK",512), m.kv_type);
+    // EXTRACT never touches the model: probe = catalog-side (nomic + lexical IDF), answer =
+    // stored text. Skipping the load makes EXTRACT GPU-free and works on TEXTONLY stores.
+    if (!env_i("EXTRACT", 0)) load_model(model, env_i("NCTX",4096), env_i("CHUNK",512), m.kv_type);
     bool low_conf = false;
     std::string out = ask_core(dir, m, rows, embraw, question, low_conf);
     printf("%s\n", out.c_str());
