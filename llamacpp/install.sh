@@ -6,9 +6,9 @@
 # What it does (idempotent, everything under ~/living-kv-cache by default):
 #   1. checks tools (git, g++, cmake, curl)
 #   2. clones llama.cpp pinned to a known-good tag and builds libllama (CUDA if available, else CPU)
-#   3. builds the poc18 demo binaries
+#   3. builds the poc18 demo binaries + the kvmem session-memory driver
 #   4. downloads a small demo model (TinyLlama Q4, ~0.6 GB); FULL=1 also pulls Qwen2.5-7B-1M (~4.7 GB)
-#   5. pulls the nomic embedder via ollama if ollama is installed (needed for poc18b..g catalogs)
+#   5. pulls the nomic embedder via ollama if ollama is installed (needed for kvmem + poc18b..g catalogs)
 #   6. runs poc18a as a smoke test
 #
 # Env overrides: LIVINGKV_DIR, LLAMA_TAG, FULL=1, SKIP_TEST=1
@@ -57,10 +57,10 @@ if [ ! -f llama.cpp/build/bin/libllama.so ]; then
 fi
 LL="$DIR/llama.cpp"
 
-# 3. demo binaries
-say "building poc18 demos..."
+# 3. demo binaries + kvmem
+say "building poc18 demos + kvmem..."
 mkdir -p bin
-for f in llamacpp/poc18*.cpp; do
+for f in llamacpp/poc18*.cpp kvmem/kvmem.cpp; do
     out="bin/$(basename "${f%_*.cpp}" | sed 's/\.cpp$//')"
     g++ -O2 -o "$out" "$f" -I "$LL/include" -I "$LL/ggml/include" -L "$LL/build/bin" -lllama -Wl,-rpath,"$LL/build/bin"
 done
@@ -76,11 +76,11 @@ if [ "${FULL:-0}" = "1" ] && [ ! -s "$QWEN" ]; then
     curl -fL --progress-bar -o "$QWEN" "$QWEN_URL"
 fi
 
-# 5. catalog embedder (poc18b..g need it; poc18a does not)
+# 5. catalog embedder (kvmem + poc18b..g need it; poc18a does not)
 if command -v ollama >/dev/null 2>&1; then
     ollama list 2>/dev/null | grep -q nomic-embed-text || { say "pulling nomic-embed-text via ollama..."; ollama pull nomic-embed-text || true; }
 else
-    say "NOTE: ollama not found. poc18a works without it; poc18b..g need the catalog embedder:"
+    say "NOTE: ollama not found. poc18a works without it; kvmem and poc18b..g need the catalog embedder:"
     say "      curl -fsSL https://ollama.com/install.sh | sh   &&   ollama pull nomic-embed-text"
 fi
 
@@ -100,3 +100,8 @@ say "  ./bin/poc18b ${M%% *} 8192                       # catalog + selective re
 say "  ./bin/poc18c ${M%% *} 131072 4096 q8_0           # 131k tokens through a 4k buffer"
 say "  ./bin/poc18d ${M%% *} 8192                       # living dynamics (decay/revival)"
 say "  ./bin/poc18g ${M%% *} 65536 budget               # decode speed where full cache OOMs"
+say ""
+say "kvmem — session memory, ingest once / ask in a later process (needs ollama + nomic-embed-text):"
+say "  printf 'The gate code is 7341.\n' > /tmp/note.txt"
+say "  MODEL=${M%% *} ./bin/kvmem ingest mystore /tmp/note.txt"
+say "  MODEL=${M%% *} ./bin/kvmem ask    mystore 'what is the gate code?'"
