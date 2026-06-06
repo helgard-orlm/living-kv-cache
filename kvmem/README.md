@@ -49,11 +49,16 @@ answer (`7341`) returned; the probe finds the same segment throughout (embedding
 the text). Cross-session chat memory: a fact told in one `chat` process is recalled verbatim by a
 fresh one.
 
-**Known gap:** recall of *ingested-document* facts from inside `chat` is weaker than via `ask` —
-the probe finds and restores the right segment, but the model tends to ignore KV that sits far
-from the live conversation head (in `ask` the question is decoded adjacent to the restored
-segment). Candidate fix: shift restored segments toward the live head via `llama_memory_seq_add`
-(RoPE re-positioning).
+**Known gap (chat doc-recall):** answering an *ingested-document* fact from inside `chat` is
+weaker than via `ask`. The probe finds and restores the right segment, but a clean A/B test
+(Qwen2.5-7B-1M) showed the cause is **not** distance from the live head — restored segments are
+re-positioned adjacent to the conversation via `llama_memory_seq_add` (`KVSHIFT=1`), and the
+output is bit-identical with the shift on or off. The real driver is the **conversational prior**:
+with no prior turn the model answers from the restored KV correctly; once a previous turn exists
+("Is there anything else?"), it trusts the dialogue framing over the injected segment and says the
+fact "wasn't mentioned". `ask` (no dialogue tail, question decoded next to the segment) does not
+have this problem. Candidate fix (next milestone): fall back to ask-style decoding inside chat on
+a strong probe hit, or splice the segment text into the prompt as explicit context.
 
 ## Store layout (`mystore/`)
 
@@ -98,7 +103,27 @@ Needs ollama with `nomic-embed-text` for the catalog. Env: `MODEL` (gguf path), 
 text), then atomically swaps; the old store stays at `<store>.bak`. This is the escape hatch for
 all three KV locks: model change, quant change, llama.cpp build change.
 
+## serve (resident daemon)
+
+One-shot `ask` reloads the model each call (~seconds). `kvmem serve <store>` keeps it resident
+and answers over plain HTTP on `127.0.0.1` (localhost only, no dependencies):
+
+```bash
+KVPORT=8345 kvmem serve mystore &
+curl -s -d "what's the gate code?" localhost:8345/ask     # ~0.3–0.5 s; header X-Low-Confidence: 1 if unknown
+curl -s localhost:8345/stats
+curl -s -X POST localhost:8345/shutdown                    # or SIGTERM — both save weights
+```
+
+## prune (cap the store)
+
+`kvmem prune <store> keep=N` (keep the N hottest) or `below=W` (drop weight < W) sinks cold
+segments: their KV is deleted and their **text is moved to `archive.tsv`** (never lost — re-ingest
+from there if needed). Run `kvmem defrag` afterwards to compact the freed token space — that is
+when defrag genuinely shrinks the store (e.g. 25 195 → 344 tokens after pruning to the 10 hottest).
+
 ## Status
 
-M2 of the session-memory driver: ingest/ask/chat/defrag/stats. Not yet: daemon API, true 4-bit
-cold store, pruning (which would make defrag genuinely compact the store).
+M3 of the session-memory driver: ingest / ask / chat / serve / prune / defrag / stats, plus a
+Hermes skill. Not yet: ask-fallback for chat doc-recall (see the gap above), OpenAI-style API,
+true 4-bit cold store, auto-ingest of session logs.

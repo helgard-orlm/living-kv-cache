@@ -36,6 +36,10 @@
 #include <unistd.h>
 #include <chrono>
 #include <cctype>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <csignal>
+#include <cerrno>
 
 static const int EMB_DIM = 768; // nomic-embed-text
 
@@ -294,6 +298,11 @@ static int cmd_ingest(const std::string &dir, const std::string &file) {
     if (existed && m.kv_type != kvt) fail("store kv_type="+m.kv_type+" but KVT="+kvt);
     if (!existed) { m.model_file=mbase; m.model_bytes=st.st_size; m.kv_type=kvt; m.build=env_s("KVMEM_BUILD","b9297"); }
 
+    // next segment id = max existing id + 1, NOT n_segments — after a prune the ids are sparse
+    // and n_segments would collide with (and overwrite) a surviving segment's .kv file
+    long base_id = 0;
+    { auto old = load_catalog(dir); for (auto &o : old) base_id = std::max(base_id, (long)o.id + 1); }
+
     load_model(model, NCTX, CHUNK, kvt);
     std::string raw = read_file(file);
     auto seg_texts = segment_text(raw, CAP);
@@ -304,7 +313,7 @@ static int cmd_ingest(const std::string &dir, const std::string &file) {
     std::vector<llama_token> ids; std::vector<CatRow> rows;
     for (size_t s = 0; s < seg_texts.size(); s++) {
         auto tk = tokenize(seg_texts[s], m.total_tokens==0 && s==0);
-        CatRow r; r.id = (int)(m.n_segments + s); r.lo = (int)(m.total_tokens + ids.size());
+        CatRow r; r.id = (int)(base_id + s); r.lo = (int)(m.total_tokens + ids.size());
         ids.insert(ids.end(), tk.begin(), tk.end());
         r.hi = (int)(m.total_tokens + ids.size()); r.w = 0.f; r.text = seg_texts[s];
         rows.push_back(r);
@@ -328,19 +337,11 @@ static int cmd_ingest(const std::string &dir, const std::string &file) {
     return 0;
 }
 
-static int cmd_ask(const std::string &dir, const std::string &question) {
-    Manifest m; if (!load_manifest(dir, m)) fail("no store at " + dir + " (run: kvmem ingest <dir> <file>)");
-    const std::string model = env_s("MODEL", "models/Qwen2.5-7B-Instruct-1M-Q4_K_M.gguf");
-    struct stat st; if (stat(model.c_str(), &st)) fail("model not found: " + model);
-    std::string mbase = model.substr(model.find_last_of('/')+1);
-    if (m.model_file != mbase || m.model_bytes != (long)st.st_size)
-        fail("store was built with model '"+m.model_file+"' ("+std::to_string(m.model_bytes)+" bytes), current MODEL is '"+mbase+"' — KV is model-locked. Re-ingest the source text with the new model.");
-    auto rows = load_catalog(dir);
-    if ((long)rows.size() != m.n_segments) fail("catalog/manifest mismatch");
-    std::string embraw = read_file(dir+"/embs.f32");
-    if (embraw.size() != rows.size()*EMB_DIM*4) fail("embs.f32 size mismatch");
+// shared by `ask` (one-shot) and `serve` (model stays resident): probe -> restore -> generate.
+// Assumes the model is loaded and the memory is empty. Updates w and writes the catalog back.
+static std::string ask_core(const std::string &dir, Manifest &m, std::vector<CatRow> &rows,
+                            const std::string &embraw, const std::string &question, bool &low_conf) {
     const float *E = (const float*)embraw.data();
-
     const int SEL=env_i("SEL",3), GEN=env_i("GEN",96); const double GAP=env_f("GAP",0.04), THRESH=env_f("THRESH",0.65), DECAY=env_f("DECAY",0.9);
     auto q = embed(question, true);
     std::vector<std::pair<float,int>> scored;
@@ -350,11 +351,10 @@ static int cmd_ask(const std::string &dir, const std::string &question) {
     std::vector<int> pick = {scored[0].second};
     for (int k = 1; k < (int)scored.size() && (int)pick.size() < SEL; k++)
         if (scored[k].first >= scored[0].first - GAP) pick.push_back(scored[k].second);
-    bool low_conf = scored[0].first < THRESH;
+    low_conf = scored[0].first < THRESH;
     fprintf(stderr, "[ask] probe top: "); for (int k=0;k<3 && k<(int)scored.size();k++) fprintf(stderr, "seg%d(%.3f) ", scored[k].second, scored[k].first);
     fprintf(stderr, "| picked %zu seg(s)%s\n", pick.size(), low_conf ? "  ⚠ LOW CONFIDENCE — likely not in memory" : "");
 
-    load_model(model, env_i("NCTX",4096), env_i("CHUNK",512), m.kv_type);
     llama_memory_t mem = llama_get_memory(g_ctx);
     // true attention sink: a BOS token at pos 0 (structural, no content — content-sinks contaminate the answer)
     int maxhi = 0;
@@ -399,12 +399,35 @@ static int cmd_ask(const std::string &dir, const std::string &question) {
         lg = decode(&best, 1, pos++, true);
     }
     while (!out.empty() && isspace((unsigned char)out.back())) out.pop_back();
-    printf("%s\n", out.c_str());
     // living update: decay all, recharge each genuinely picked segment by its own probe score
     std::map<int,float> score_of; for (auto &si : scored) score_of[si.second] = si.first;
     for (auto &r : rows) r.w *= (float)DECAY;
     for (int id : pick) rows[id].w += score_of[id]; // recharge each genuinely picked segment
     save_catalog(dir, rows);
+    return out;
+}
+
+// validate store-vs-MODEL and load everything; shared by ask/serve
+static void open_store(const std::string &dir, Manifest &m, std::vector<CatRow> &rows, std::string &embraw, std::string &model) {
+    if (!load_manifest(dir, m)) fail("no store at " + dir + " (run: kvmem ingest <dir> <file>)");
+    model = env_s("MODEL", "models/Qwen2.5-7B-Instruct-1M-Q4_K_M.gguf");
+    struct stat st; if (stat(model.c_str(), &st)) fail("model not found: " + model);
+    std::string mbase = model.substr(model.find_last_of('/')+1);
+    if (m.model_file != mbase || m.model_bytes != (long)st.st_size)
+        fail("store was built with model '"+m.model_file+"' ("+std::to_string(m.model_bytes)+" bytes), current MODEL is '"+mbase+"' — KV is model-locked. Run `kvmem defrag` with the new MODEL to migrate.");
+    rows = load_catalog(dir);
+    if ((long)rows.size() != m.n_segments) fail("catalog/manifest mismatch");
+    embraw = read_file(dir+"/embs.f32");
+    if (embraw.size() != rows.size()*EMB_DIM*4) fail("embs.f32 size mismatch");
+}
+
+static int cmd_ask(const std::string &dir, const std::string &question) {
+    Manifest m; std::vector<CatRow> rows; std::string embraw, model;
+    open_store(dir, m, rows, embraw, model);
+    load_model(model, env_i("NCTX",4096), env_i("CHUNK",512), m.kv_type);
+    bool low_conf = false;
+    std::string out = ask_core(dir, m, rows, embraw, question, low_conf);
+    printf("%s\n", out.c_str());
     return low_conf ? 2 : 0;
 }
 
@@ -481,10 +504,32 @@ static int cmd_chat(const std::string &dir) {
             for (int id : pick) rows[id].w += score_of[id];
             fprintf(stderr, "[recall] top %.3f, restored %zu old seg(s)\n", top, pick.size());
         }
-        for (int id : pick) {
-            std::string b = read_file(dir+"/segments/"+std::to_string(rows[id].id)+".kv");
-            std::vector<uint8_t> buf(b.begin(), b.end());
-            restore_buf(mem, buf);
+        // RoPE-shift (M3): a restored segment far from the live head gets ignored by attention
+        // (M2 finding: probe hit seg, model said "wasn't mentioned"). Pack restored segments
+        // tightly BELOW the live window via seq_add (llama.cpp K-shift — same machinery as
+        // context shifting), so they sit next to the conversation. Shift is cache-only and
+        // temporary: the store keeps original positions; removal uses the shifted span.
+        const bool KVSHIFT = env_i("KVSHIFT", 1) != 0;
+        std::vector<std::pair<int,int>> restored_spans;
+        if (!pick.empty()) {
+            std::vector<int> order = pick;                 // document order reads better than score order
+            std::sort(order.begin(), order.end(), [&](int a, int b){ return rows[a].lo < rows[b].lo; });
+            int total_len = 0; for (int id : order) total_len += rows[id].hi - rows[id].lo;
+            int place = live_lo - total_len;               // pack [place, live_lo)
+            bool can_shift = KVSHIFT && place >= 1;        // keep pos 0 for the BOS sink
+            for (int id : order) {
+                std::string b = read_file(dir+"/segments/"+std::to_string(rows[id].id)+".kv");
+                std::vector<uint8_t> buf(b.begin(), b.end());
+                restore_buf(mem, buf);
+                int L = rows[id].hi - rows[id].lo;
+                if (can_shift && rows[id].hi != live_lo) { // tail-adjacent needs no shift
+                    llama_memory_seq_add(mem, 0, rows[id].lo, rows[id].hi, place - rows[id].lo);
+                    restored_spans.push_back({place, place + L});
+                } else {
+                    restored_spans.push_back({rows[id].lo, rows[id].hi});
+                }
+                if (can_shift) place += L;
+            }
         }
         // copy-bias source: recalled segments' stored text
         std::vector<uint8_t> in_copy;
@@ -518,13 +563,14 @@ static int cmd_chat(const std::string &dir) {
             if (out.size() > 2 && (out.find("\n\n") != std::string::npos || ws_run >= 3)) break;
         }
         printf("\n");
-        // drop recalled old segments from the live window (disk keeps them)
-        for (int id : pick) llama_memory_seq_rm(mem, 0, rows[id].lo, rows[id].hi);
+        // drop recalled old segments from the live window (disk keeps them) — shifted spans!
+        for (auto &sp : restored_spans) llama_memory_seq_rm(mem, 0, sp.first, sp.second);
 
         // commit the turn: one segment = user line + answer (crash-safe, every turn)
         int turn_hi = (int)pos;
         auto buf = spill_range(mem, turn_lo, turn_hi);
-        CatRow r; r.id = (int)m.n_segments; r.lo = turn_lo; r.hi = turn_hi; r.w = 0.f;
+        int new_id = 0; for (auto &rr : rows) new_id = std::max(new_id, rr.id + 1); // ids sparse after prune
+        CatRow r; r.id = new_id; r.lo = turn_lo; r.hi = turn_hi; r.w = 0.f;
         r.text = turn + out;
         write_file(dir+"/segments/"+std::to_string(r.id)+".kv", buf.data(), buf.size());
         auto e = embed(r.text, false);
@@ -545,6 +591,53 @@ static int cmd_chat(const std::string &dir) {
     free(line);
     save_catalog(dir, rows); // persist w updates
     fprintf(stderr, "[chat] saved: %ld tokens, %ld segments\n", m.total_tokens, m.n_segments);
+    return 0;
+}
+
+// prune (M3): sink cold segments. Their KV is deleted and the catalog row moves to archive.tsv
+// — the TEXT is never lost (re-ingest from archive if ever needed). Surviving rows keep their
+// ids and positions; run `kvmem defrag` afterwards to actually compact the token space.
+static int cmd_prune(const std::string &dir, const std::string &spec) {
+    Manifest m; if (!load_manifest(dir, m)) fail("no store at " + dir);
+    auto rows = load_catalog(dir);
+    if ((long)rows.size() != m.n_segments) fail("catalog/manifest mismatch");
+    std::string embraw = read_file(dir+"/embs.f32");
+    if (embraw.size() != rows.size()*EMB_DIM*4) fail("embs.f32 size mismatch");
+
+    std::vector<char> drop(rows.size(), 0);
+    if (spec.rfind("keep=", 0) == 0) {
+        int N = atoi(spec.c_str()+5); if (N < 1) fail("keep=N needs N >= 1");
+        std::vector<int> idx(rows.size()); for (size_t i=0;i<rows.size();i++) idx[i]=(int)i;
+        std::stable_sort(idx.begin(), idx.end(), [&](int a,int b){ return rows[a].w > rows[b].w; });
+        for (size_t k = N; k < idx.size(); k++) drop[idx[k]] = 1;
+    } else if (spec.rfind("below=", 0) == 0) {
+        float W = (float)atof(spec.c_str()+6);
+        size_t kept = 0;
+        for (size_t i=0;i<rows.size();i++) { if (rows[i].w < W) drop[i]=1; else kept++; }
+        if (!kept) fail("below=" + std::to_string(W) + " would drop everything");
+    } else fail("prune spec: keep=N (hottest) or below=W (drop w < W)");
+
+    long n_drop = 0; for (char d : drop) n_drop += d;
+    if (!n_drop) { fprintf(stderr, "[prune] nothing to drop\n"); return 0; }
+
+    FILE *a = fopen((dir+"/archive.tsv").c_str(), "a"); if (!a) fail("cannot write archive.tsv");
+    std::vector<CatRow> keep; std::string kembs; kembs.reserve((rows.size()-n_drop)*EMB_DIM*4);
+    for (size_t i = 0; i < rows.size(); i++) {
+        if (drop[i]) {
+            fprintf(a, "%d\t%d\t%d\t%.5f\t%s\n", rows[i].id, rows[i].lo, rows[i].hi, rows[i].w, tsv_escape(rows[i].text).c_str());
+            unlink((dir+"/segments/"+std::to_string(rows[i].id)+".kv").c_str());
+        } else {
+            keep.push_back(rows[i]);
+            kembs.append(embraw, i*EMB_DIM*4, EMB_DIM*4);
+        }
+    }
+    fclose(a);
+    write_file(dir+"/embs.f32", kembs.data(), kembs.size());
+    save_catalog(dir, keep);
+    m.n_segments = (long)keep.size();
+    save_manifest(dir, m);
+    fprintf(stderr, "[prune] dropped %ld of %zu segments (text kept in archive.tsv); run `kvmem defrag %s` to compact\n",
+            n_drop, rows.size(), dir.c_str());
     return 0;
 }
 
@@ -598,6 +691,84 @@ static int cmd_defrag(const std::string &dir) {
     return 0;
 }
 
+// serve (M3): keep the model RESIDENT and answer over plain HTTP (localhost only, no deps).
+// One-shot `ask` pays ~seconds of model load per question; serve pays it once.
+//   curl -s localhost:8345/stats
+//   curl -s -d "what's the gate code?" localhost:8345/ask     (answer in body;
+//        X-Low-Confidence: 1 header when the probe score is below THRESH)
+//   curl -s -X POST localhost:8345/shutdown                   (or SIGTERM — both save w)
+static volatile sig_atomic_t g_srv_stop = 0;
+static void srv_on_term(int) { g_srv_stop = 1; }
+
+static int cmd_serve(const std::string &dir) {
+    Manifest m; std::vector<CatRow> rows; std::string embraw, model;
+    open_store(dir, m, rows, embraw, model);
+    g_emb_cpu = env_i("EMB_CPU", 1) != 0;     // model stays resident -> nomic embeds on CPU
+    load_model(model, env_i("NCTX",4096), env_i("CHUNK",512), m.kv_type);
+    llama_memory_t mem = llama_get_memory(g_ctx);
+
+    int port = env_i("KVPORT", 8345);
+    int s = socket(AF_INET, SOCK_STREAM, 0); if (s < 0) fail("socket failed");
+    int one = 1; setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons((uint16_t)port);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);                 // localhost ONLY
+    if (bind(s, (sockaddr*)&a, sizeof a)) fail("bind 127.0.0.1:" + std::to_string(port) + " failed (port busy? set KVPORT)");
+    if (listen(s, 8)) fail("listen failed");
+    struct sigaction sa{}; sa.sa_handler = srv_on_term; sigaction(SIGTERM, &sa, nullptr); sigaction(SIGINT, &sa, nullptr);
+    fprintf(stderr, "[serve] %s ready on 127.0.0.1:%d — POST /ask, GET /stats, POST /shutdown\n", dir.c_str(), port);
+
+    while (!g_srv_stop) {
+        int c = accept(s, nullptr, nullptr);
+        if (c < 0) { if (errno == EINTR) continue; break; }
+        std::string req; char buf[8192]; ssize_t n;
+        size_t hdr_end = std::string::npos; long clen = 0;
+        while ((n = recv(c, buf, sizeof buf, 0)) > 0) {
+            req.append(buf, n);
+            if (hdr_end == std::string::npos) {
+                hdr_end = req.find("\r\n\r\n");
+                if (hdr_end != std::string::npos) {
+                    size_t p = req.find("Content-Length:"); // also matches lowercase via retry below
+                    if (p == std::string::npos) p = req.find("content-length:");
+                    if (p != std::string::npos && p < hdr_end) clen = atol(req.c_str() + p + 15);
+                }
+            }
+            if (hdr_end != std::string::npos && req.size() >= hdr_end + 4 + (size_t)clen) break;
+        }
+        if (hdr_end == std::string::npos) { close(c); continue; }
+        std::string method = req.substr(0, req.find(' '));
+        size_t ps = req.find(' ') + 1;
+        std::string path = req.substr(ps, req.find(' ', ps) - ps);
+        std::string body = req.substr(hdr_end + 4, clen);
+
+        int code = 200; std::string out, xtra;
+        if (path == "/stats") {
+            char hb[512];
+            snprintf(hb, sizeof hb, "model=%s kv=%s tokens=%ld segments=%ld\n", m.model_file.c_str(), m.kv_type.c_str(), m.total_tokens, m.n_segments);
+            out = hb;
+            auto byw = rows; std::sort(byw.begin(), byw.end(), [](const CatRow&x, const CatRow&y){ return x.w > y.w; });
+            for (int i = 0; i < 5 && i < (int)byw.size(); i++)
+                out += "seg" + std::to_string(byw[i].id) + " w=" + std::to_string(byw[i].w).substr(0,5) + "  " + byw[i].text.substr(0, 70) + "...\n";
+        } else if (path == "/ask" && method == "POST" && !body.empty()) {
+            llama_memory_clear(mem, true);                 // each ask starts from a clean cache
+            bool low = false;
+            out = ask_core(dir, m, rows, embraw, body, low) + "\n";
+            xtra = std::string("X-Low-Confidence: ") + (low ? "1" : "0") + "\r\n";
+        } else if (path == "/shutdown" && method == "POST") {
+            out = "bye\n"; g_srv_stop = 1;
+        } else { code = 404; out = "kvmem serve: POST /ask (body=question), GET /stats, POST /shutdown\n"; }
+
+        char hdr[512];
+        int hn = snprintf(hdr, sizeof hdr, "HTTP/1.1 %d %s\r\nContent-Type: text/plain; charset=utf-8\r\n%sContent-Length: %zu\r\nConnection: close\r\n\r\n",
+                          code, code == 200 ? "OK" : "Not Found", xtra.c_str(), out.size());
+        send(c, hdr, hn, MSG_NOSIGNAL); send(c, out.data(), out.size(), MSG_NOSIGNAL);
+        close(c);
+    }
+    close(s);
+    save_catalog(dir, rows);                               // w already saved per ask; belt for SIGTERM mid-flight
+    fprintf(stderr, "[serve] stopped, catalog saved\n");
+    return 0;
+}
+
 static int cmd_stats(const std::string &dir) {
     Manifest m; if (!load_manifest(dir, m)) fail("no store at " + dir);
     printf("model=%s (%ld bytes)  kv=%s  build=%s\ntokens=%ld  segments=%ld\n",
@@ -618,9 +789,11 @@ int main(int argc, char **argv) {
                         "  kvmem ingest <store_dir> <text_file>\n"
                         "  kvmem ask    <store_dir> \"question\"\n"
                         "  kvmem chat   <store_dir>            # interactive; later sessions remember\n"
+                        "  kvmem serve  <store_dir>            # resident model + HTTP /ask /stats (KVPORT=8345)\n"
+                        "  kvmem prune  <store_dir> keep=N|below=W  # sink cold segments (text -> archive.tsv)\n"
                         "  kvmem defrag <store_dir>            # rebuild from stored text (MODEL=... migrates)\n"
                         "  kvmem stats  <store_dir>\n"
-                        "env: MODEL=<gguf> KVT=q8_0 NCTX=4096 SEL=3 GAP=0.04 THRESH=0.65 GEN=96 COPYB=2.0\n");
+                        "env: MODEL=<gguf> KVT=q8_0 NCTX=4096 SEL=3 GAP=0.04 THRESH=0.65 GEN=96 COPYB=2.0 KVSHIFT=1\n");
         return 1;
     }
     llama_log_set([](ggml_log_level l, const char *t, void*){ if (l >= GGML_LOG_LEVEL_ERROR) fputs(t, stderr); }, nullptr);
@@ -628,6 +801,8 @@ int main(int argc, char **argv) {
     if (cmd == "ingest" && argc > 3) return cmd_ingest(dir, argv[3]);
     if (cmd == "ask"    && argc > 3) return cmd_ask(dir, argv[3]);
     if (cmd == "chat")               return cmd_chat(dir);
+    if (cmd == "serve")              return cmd_serve(dir);
+    if (cmd == "prune"  && argc > 3) return cmd_prune(dir, argv[3]);
     if (cmd == "defrag")             return cmd_defrag(dir);
     if (cmd == "stats")              return cmd_stats(dir);
     fprintf(stderr, "kvmem: bad arguments\n"); return 1;
