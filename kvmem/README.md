@@ -34,10 +34,26 @@ the text** — recall, not re-reading. Restore is milliseconds; no re-prefill of
 
 **Copy-bias (M2):** exact verbatim recall of a *novel multi-token string* (e.g. an invented
 hostname `cobalt-finch`) used to get paraphrased even though the correct segment was retrieved.
-Generation is greedy, so this is not a sampling issue; the fix is a **copy bias** — tokens that
-occur in the recalled segments' *stored text* get a logit bonus (`COPYB=2.0`), tipping near-ties
-toward verbatim copy. The KV path stays pure: the stored text contributes token IDs only, it is
-never re-prefilled. Verified on the small-model smoke; large-model verification pending.
+Generation is greedy, so this is not a sampling issue. Two fixes landed together: a catalog
+parsing bug that silently drifted the stored text away from the KV (the likely root cause), and a
+**copy bias** — tokens that occur in the recalled segments' *stored text* get a logit bonus
+(`COPYB=2.0`). The KV path stays pure: the stored text contributes token IDs only, it is never
+re-prefilled. Verified on Qwen2.5-7B-1M: all three planted needles, including `cobalt-finch`,
+now come back verbatim; honestly, the COPYB=0 control also passed there, so on a capable model
+the parsing fix may carry most of the weight — the bias measurably helps small models stop
+cleanly instead of hallucinating a fake Q&A continuation.
+
+**Verified (M2, Qwen2.5-7B-1M Q4):** model-migration round-trip — a store built by Qwen was
+migrated to TinyLlama (different tokenizer, 25.3k → 31.6k tokens) and back, after which the exact
+answer (`7341`) returned; the probe finds the same segment throughout (embeddings depend only on
+the text). Cross-session chat memory: a fact told in one `chat` process is recalled verbatim by a
+fresh one.
+
+**Known gap:** recall of *ingested-document* facts from inside `chat` is weaker than via `ask` —
+the probe finds and restores the right segment, but the model tends to ignore KV that sits far
+from the live conversation head (in `ask` the question is decoded adjacent to the restored
+segment). Candidate fix: shift restored segments toward the live head via `llama_memory_seq_add`
+(RoPE re-positioning).
 
 ## Store layout (`mystore/`)
 
