@@ -42,7 +42,12 @@
 #include <csignal>
 #include <cerrno>
 
-static const int EMB_DIM = 768; // nomic-embed-text
+// Embedder is a per-store property (M6): mixing embedding models in one embs.f32 is garbage,
+// so the model name + dim live in the manifest and are applied on store open. Legacy stores
+// (no emb_* keys) default to nomic/768. `kvmem reembed <dir>` migrates a store (EMB=bge-m3
+// fixes the RU channel: nomic is EN-centric, proven on the session-search pilot 2026-06-02).
+static int EMB_DIM = 768;                              // 0 = learn from the first embedding
+static std::string EMB_MODEL = "nomic-embed-text";
 
 // ---------- small utils ----------
 static std::string env_s(const char *k, const char *d) { const char *v = getenv(k); return v ? v : d; }
@@ -69,7 +74,7 @@ static std::string tsv_unescape(const std::string &s) {
 }
 
 // ---------- store ----------
-struct Manifest { std::string model_file, kv_type, build; long model_bytes=0, total_tokens=0, n_segments=0; };
+struct Manifest { std::string model_file, kv_type, build, emb_model="nomic-embed-text"; long model_bytes=0, total_tokens=0, n_segments=0, emb_dim=768; };
 struct CatRow { int id, lo, hi; float w; std::string text; };
 
 static std::string mpath(const std::string &d){return d+"/manifest.txt";}
@@ -82,13 +87,22 @@ static bool load_manifest(const std::string &dir, Manifest &m) {
         if (k=="model_file") m.model_file=v; else if (k=="kv_type") m.kv_type=v; else if (k=="build") m.build=v;
         else if (k=="model_bytes") m.model_bytes=atol(v.c_str()); else if (k=="total_tokens") m.total_tokens=atol(v.c_str());
         else if (k=="n_segments") m.n_segments=atol(v.c_str());
+        else if (k=="emb_model") m.emb_model=v; else if (k=="emb_dim") m.emb_dim=atol(v.c_str());
     }
     fclose(f); return true;
 }
+// store's embedder becomes the process embedder; EMB env may only confirm, never silently mix
+static void apply_emb(const Manifest &m) {
+    EMB_MODEL = m.emb_model; EMB_DIM = (int)m.emb_dim;
+    std::string e = env_s("EMB", "");
+    if (!e.empty() && e != EMB_MODEL)
+        fail("store is embedded with '" + EMB_MODEL + "' but EMB=" + e + " — run `kvmem reembed` to migrate");
+}
 static void save_manifest(const std::string &dir, const Manifest &m) {
     char buf[1024];
-    int n = snprintf(buf, sizeof buf, "model_file=%s\nmodel_bytes=%ld\nkv_type=%s\nbuild=%s\ntotal_tokens=%ld\nn_segments=%ld\n",
-                     m.model_file.c_str(), m.model_bytes, m.kv_type.c_str(), m.build.c_str(), m.total_tokens, m.n_segments);
+    int n = snprintf(buf, sizeof buf, "model_file=%s\nmodel_bytes=%ld\nkv_type=%s\nbuild=%s\ntotal_tokens=%ld\nn_segments=%ld\nemb_model=%s\nemb_dim=%ld\n",
+                     m.model_file.c_str(), m.model_bytes, m.kv_type.c_str(), m.build.c_str(), m.total_tokens, m.n_segments,
+                     m.emb_model.c_str(), m.emb_dim);
     write_file(mpath(dir), buf, n);
 }
 static std::vector<CatRow> load_catalog(const std::string &dir) {
@@ -154,10 +168,12 @@ static std::vector<float> embed(const std::string &text, bool query) {
     auto it = cache.find(key); if (it != cache.end()) return it->second;
     // payload goes through a temp file — never through shell quoting (real text breaks '...')
     std::string clean = utf8_sanitize(text);
-    if (clean.size() > 6000) clean = utf8_sanitize(clean.substr(0, 6000)); // belt: nomic ctx is finite
-    std::string payload = std::string("{\"model\":\"nomic-embed-text\",")
+    if (clean.size() > 6000) clean = utf8_sanitize(clean.substr(0, 6000)); // belt: embedder ctx is finite
+    // task prefixes are a nomic convention; bge-m3 (and most others) are trained without them
+    bool nomic = EMB_MODEL.rfind("nomic", 0) == 0;
+    std::string payload = std::string("{\"model\":\"") + EMB_MODEL + "\","
         + (g_emb_cpu ? "\"options\":{\"num_gpu\":0}," : "") + "\"prompt\":\""
-        + (query ? "search_query: " : "search_document: ") + json_escape(clean) + "\"}";
+        + (nomic ? (query ? "search_query: " : "search_document: ") : "") + json_escape(clean) + "\"}";
     char tmpl[] = "/tmp/kvmem_emb_XXXXXX"; int fd = mkstemp(tmpl);
     if (fd < 0) fail("mkstemp failed");
     if (write(fd, payload.data(), payload.size()) != (ssize_t)payload.size()) fail("tmp write failed");
@@ -171,10 +187,11 @@ static std::vector<float> embed(const std::string &text, bool query) {
         fprintf(stderr, "[embed] curl rc=%d payload_bytes=%zu (kept /tmp/kvmem_emb_fail.json)\n", rc, payload.size());
     } else unlink(tmpl);
     std::vector<float> v; const char *s = strstr(resp.c_str(), "\"embedding\":[");
-    if (!s) fail("embedding failed (server said: " + resp.substr(0, 160) + ").\nkvmem needs ollama with nomic-embed-text:\n  curl -fsSL https://ollama.com/install.sh | sh && ollama pull nomic-embed-text");
+    if (!s) fail("embedding failed (server said: " + resp.substr(0, 160) + ").\nkvmem needs ollama with " + EMB_MODEL + ":\n  curl -fsSL https://ollama.com/install.sh | sh && ollama pull " + EMB_MODEL);
     s += 13; char *e;
     while (*s && *s != ']') { v.push_back((float)strtod(s, &e)); s = (*e==',') ? e+1 : e; }
-    if ((int)v.size() != EMB_DIM) fail("unexpected embedding size");
+    if (EMB_DIM == 0) EMB_DIM = (int)v.size();         // new store / reembed: learn the dim
+    if ((int)v.size() != EMB_DIM) fail("embedding size " + std::to_string(v.size()) + " != store emb_dim " + std::to_string(EMB_DIM));
     cache[key] = v; return v;
 }
 static float cosine(const float *a, const float *b) {
@@ -223,10 +240,10 @@ static void load_vocab_only(const std::string &model_path) {
     if (!g_model) fail("vocab load failed: " + model_path);
     g_vocab = llama_model_get_vocab(g_model);
 }
-static std::vector<llama_token> tokenize(const std::string &t, bool add_special) {
-    int n = -llama_tokenize(g_vocab, t.c_str(), (int)t.size(), nullptr, 0, add_special, false);
+static std::vector<llama_token> tokenize(const std::string &t, bool add_special, bool parse_special = false) {
+    int n = -llama_tokenize(g_vocab, t.c_str(), (int)t.size(), nullptr, 0, add_special, parse_special);
     std::vector<llama_token> out(std::max(n, 0));
-    if (n > 0) llama_tokenize(g_vocab, t.c_str(), (int)t.size(), out.data(), n, add_special, false);
+    if (n > 0) llama_tokenize(g_vocab, t.c_str(), (int)t.size(), out.data(), n, add_special, parse_special);
     return out;
 }
 static float *decode_seq(const llama_token *toks, int n, llama_pos pos0, bool want_logits, int seq) {
@@ -246,7 +263,9 @@ static float *decode(const llama_token *toks, int n, llama_pos pos0, bool want_l
 // greedy generation with copy-bias + stop conditions, in sequence `seq`. `lg0` = logits for the
 // first step (already decoded). Returns the generated text. Used by chat's ask-fallback path.
 static std::string gen_loop(float *lg, llama_pos pos, int seq, int GEN,
-                            const std::vector<uint8_t> &in_copy, float COPYB) {
+                            const std::vector<uint8_t> &in_copy, float COPYB, bool stop_blank = true) {
+    // stop_blank: chat-style answers end at the first blank line; GROUND answers are
+    // multi-paragraph (lists etc.) and rely on eos / GEN budget instead.
     const int nv = llama_vocab_n_tokens(g_vocab);
     llama_token eos = llama_vocab_eos(g_vocab);
     std::string out; int ws_run = 0;
@@ -259,7 +278,7 @@ static std::string gen_loop(float *lg, llama_pos pos, int seq, int GEN,
         lg = decode_seq(&best, 1, pos++, true, seq);
         out += ps;
         ws_run = (ps.find_first_not_of(" \t\n\r") == std::string::npos) ? ws_run + 1 : 0;
-        if (out.size() > 2 && (out.find("\n\n") != std::string::npos || ws_run >= 3)) break;
+        if (out.size() > 2 && ((stop_blank && out.find("\n\n") != std::string::npos) || ws_run >= 3)) break;
     }
     while (!out.empty() && isspace((unsigned char)out.back())) out.pop_back();
     return out;
@@ -364,6 +383,8 @@ static int cmd_ingest(const std::string &dir, const std::string &file) {
         fail("store was built with model '"+m.model_file+"' — refusing to mix models in one store");
     if (existed && m.kv_type != kvt) fail("store kv_type="+m.kv_type+" but KVT="+kvt);
     if (!existed) { m.model_file=mbase; m.model_bytes=st.st_size; m.kv_type=kvt; m.build=env_s("KVMEM_BUILD","b9297"); }
+    if (existed) apply_emb(m);
+    else { EMB_MODEL = env_s("EMB", "nomic-embed-text"); EMB_DIM = 0; m.emb_model = EMB_MODEL; }
 
     // next segment id = max existing id + 1, NOT n_segments — after a prune the ids are sparse
     // and n_segments would collide with (and overwrite) a surviving segment's .kv file
@@ -402,7 +423,7 @@ static int cmd_ingest(const std::string &dir, const std::string &file) {
     { FILE *f = fopen((dir+"/catalog.tsv").c_str(), existed ? "a" : "w"); if (!f) fail("catalog write");
       for (auto &r : rows) fprintf(f, "%d\t%d\t%d\t%.5f\t%s\n", r.id, r.lo, r.hi, r.w, tsv_escape(r.text).c_str());
       fclose(f); }
-    m.total_tokens = base + N; m.n_segments += (long)rows.size();
+    m.total_tokens = base + N; m.n_segments += (long)rows.size(); m.emb_dim = EMB_DIM;
     save_manifest(dir, m);
     fprintf(stderr, "[ingest] done: +%d tokens (%.0f tok/s) -> total %ld tokens, %ld segments\n", N, secs > 0 ? N/secs : 0.0, m.total_tokens, m.n_segments);
     return 0;
@@ -467,17 +488,69 @@ static std::string ask_core(const std::string &dir, Manifest &m, std::vector<Cat
                             const std::string &embraw, const std::string &question, bool &low_conf) {
     const int SEL=env_i("SEL",3), GEN=env_i("GEN",96); const double GAP=env_f("GAP",0.04), THRESH=env_f("THRESH",0.65), DECAY=env_f("DECAY",0.9);
     float sem_top, lex_top; std::map<int,float> score_of;
-    std::vector<int> pick = hybrid_probe(rows, embraw, question, SEL, GAP, THRESH, sem_top, lex_top, low_conf, score_of);
+    // Text modes (EXTRACT/GROUND) read the full SEL: the GAP confidence-cut is a poc18f lesson
+    // about KV-restore generation (similar-but-wrong KV distracts); prompt-grounded reading is
+    // the opposite regime — an extra excerpt is cheap and brings the defining segment along
+    // (caught: a fresh status segment crowded out the definition, GROUND drifted to its prior).
+    const bool textmode = env_i("EXTRACT", 0) || env_i("GROUND", 0);
+    std::vector<int> pick = hybrid_probe(rows, embraw, question, SEL, textmode ? 1e9 : GAP, THRESH, sem_top, lex_top, low_conf, score_of);
     std::sort(pick.begin(), pick.end()); // document order reads better than fused order
+
+    // Tiny picked segments are markdown headers/fragments — the probe loves their exact terms
+    // ("## Что теперь умеет kvmem") but they carry no content (caught on the full cc store,
+    // 38k segments: headers beat bodies). A header is a POINTER to the body right after it, so
+    // extend each pick with following document-order neighbours until ~MINCH chars accumulated.
+    // Text-reading paths only (EXTRACT/GROUND); the KV-restore path is untouched.
+    std::vector<int> read_ids;
+    { const int MINCH = env_i("MINCH", 300);
+      std::set<int> seen;
+      for (int id : pick) {
+          int len = 0;
+          for (int j = id; j < (int)rows.size() && j <= id + 4; j++) {
+              if (len >= MINCH && j > id) break;
+              seen.insert(j); len += (int)rows[j].text.size();
+          }
+      }
+      read_ids.assign(seen.begin(), seen.end()); }   // std::set = sorted = document order
 
     // EXTRACT mode (M5): for messy logs, free generation confabulates (wikiq echo-attractor) —
     // return the stored text of the recalled segments instead. Honest "here's what we had".
     if (env_i("EXTRACT", 0)) {
         std::string out;
-        for (int id : pick) { out += rows[id].text; if (out.size() && out.back() != '\n') out += '\n'; }
+        for (int id : read_ids) { out += rows[id].text; if (out.size() && out.back() != '\n') out += '\n'; }
         for (auto &r : rows) r.w *= (float)DECAY; for (int id : pick) rows[id].w += score_of[id];
         save_catalog(dir, rows);
         return out;
+    }
+
+    // GROUND mode (M6): probe-picked stored TEXT goes into the prompt as evidence, the model
+    // answers in its own words. Free generation from distant KV confabulates on real terms with
+    // a competing parametric prior (M5: "kvmem -> virtualized memory" with the right segment
+    // restored). Evidence-in-prompt is the regime the model is trained for — prior loses to
+    // text under its nose. This is the honest "answer in your own words" for log stores.
+    if (env_i("GROUND", 0)) {
+        for (auto &r : rows) r.w *= (float)DECAY;
+        if (low_conf) { save_catalog(dir, rows); return "(low confidence — likely not in memory)"; }
+        for (int id : pick) rows[id].w += score_of[id];
+        save_catalog(dir, rows);
+        std::string prompt =
+            "<|im_start|>system\n"
+            "You answer questions from the user's past work-session notes. Use ONLY the excerpts below — "
+            "never your own knowledge. If they answer the question, answer it. If they are only related, "
+            "summarize what they DO say about the topic and note what is missing. Never guess what a term "
+            "means beyond the excerpts. Only if they are entirely unrelated, say \"not in the excerpts\". "
+            "Answer in the question's language. Be concise.<|im_end|>\n"
+            "<|im_start|>user\nExcerpts:\n";
+        for (int id : read_ids) { prompt += "---\n" + rows[id].text + "\n"; }
+        prompt += "---\nQuestion: " + question + "<|im_end|>\n<|im_start|>assistant\n";
+        auto pids = tokenize(prompt, true, true);          // chat-template tokens are special
+        // prefill in n_batch-sized chunks — one llama_decode call is capped by cparams.n_batch
+        float *lg = nullptr; const int CH = env_i("CHUNK", 512);
+        for (int i = 0; i < (int)pids.size(); i += CH) {
+            int e = std::min(i + CH, (int)pids.size());
+            lg = decode(pids.data() + i, e - i, i, e == (int)pids.size());
+        }
+        return gen_loop(lg, (llama_pos)pids.size(), 0, std::max(GEN, 256), {}, 0.f, /*stop_blank=*/false);
     }
 
     llama_memory_t mem = llama_get_memory(g_ctx);
@@ -534,6 +607,7 @@ static std::string ask_core(const std::string &dir, Manifest &m, std::vector<Cat
 // validate store-vs-MODEL and load everything; shared by ask/serve
 static void open_store(const std::string &dir, Manifest &m, std::vector<CatRow> &rows, std::string &embraw, std::string &model) {
     if (!load_manifest(dir, m)) fail("no store at " + dir + " (run: kvmem ingest <dir> <file>)");
+    apply_emb(m);
     model = env_s("MODEL", "models/Qwen2.5-7B-Instruct-1M-Q4_K_M.gguf");
     struct stat st; if (stat(model.c_str(), &st)) fail("model not found: " + model);
     std::string mbase = model.substr(model.find_last_of('/')+1);
@@ -580,6 +654,8 @@ static int cmd_chat(const std::string &dir) {
         fail("store was built with model '"+m.model_file+"' — KV is model-locked (kvmem defrag migrates)");
     if (existed && m.kv_type != kvt) fail("store kv_type="+m.kv_type+" but KVT="+kvt);
     if (!existed) { m.model_file=mbase; m.model_bytes=st.st_size; m.kv_type=kvt; m.build=env_s("KVMEM_BUILD","b9297"); }
+    if (existed) apply_emb(m);
+    else { EMB_MODEL = env_s("EMB", "nomic-embed-text"); EMB_DIM = 0; m.emb_model = EMB_MODEL; }
     auto rows = load_catalog(dir);
     std::string embraw = existed ? read_file(dir+"/embs.f32") : std::string();
     if (embraw.size() != rows.size()*EMB_DIM*4) fail("embs.f32 size mismatch");
@@ -716,7 +792,7 @@ static int cmd_chat(const std::string &dir) {
         { FILE *f = fopen((dir+"/catalog.tsv").c_str(), "a"); if (!f) fail("catalog write");
           fprintf(f, "%d\t%d\t%d\t%.5f\t%s\n", r.id, r.lo, r.hi, r.w, tsv_escape(r.text).c_str()); fclose(f); }
         rows.push_back(r);
-        m.total_tokens = turn_hi; m.n_segments++;
+        m.total_tokens = turn_hi; m.n_segments++; m.emb_dim = EMB_DIM;
         save_manifest(dir, m);
 
         // live-window budget: evict oldest live segments once the window outgrows ~NCTX/2
@@ -736,6 +812,7 @@ static int cmd_chat(const std::string &dir) {
 // ids and positions; run `kvmem defrag` afterwards to actually compact the token space.
 static int cmd_prune(const std::string &dir, const std::string &spec) {
     Manifest m; if (!load_manifest(dir, m)) fail("no store at " + dir);
+    apply_emb(m);
     auto rows = load_catalog(dir);
     if ((long)rows.size() != m.n_segments) fail("catalog/manifest mismatch");
     std::string embraw = read_file(dir+"/embs.f32");
@@ -819,6 +896,7 @@ static int cmd_defrag(const std::string &dir) {
     Manifest m; m.model_file = model.substr(model.find_last_of('/')+1); m.model_bytes = stm.st_size;
     m.kv_type = kvt; m.build = env_s("KVMEM_BUILD", "b9297");
     m.total_tokens = (long)ids.size(); m.n_segments = (long)rows.size();
+    m.emb_model = mold.emb_model; m.emb_dim = mold.emb_dim;   // embs.f32 is copied verbatim
     save_manifest(ndir, m);
 
     if (rename(dir.c_str(), bdir.c_str())) fail("swap failed: cannot move " + dir + " aside");
@@ -906,6 +984,42 @@ static int cmd_serve(const std::string &dir) {
     return 0;
 }
 
+// reembed (M6): rewrite embs.f32 with a different ollama embedding model (EMB=bge-m3 etc.).
+// Text and KV are untouched — embeddings are catalog-side. The 7B is never loaded, so the
+// embedder may use the GPU (EMB_CPU=0 default here, unlike chat/serve where the 7B is resident).
+static int cmd_reembed(const std::string &dir) {
+    Manifest m; if (!load_manifest(dir, m)) fail("no store at " + dir);
+    auto rows = load_catalog(dir);
+    if ((long)rows.size() != m.n_segments) fail("catalog/manifest mismatch");
+    std::string target = env_s("EMB", "");
+    if (target.empty()) fail("set EMB=<ollama embedding model>, e.g. EMB=bge-m3");
+    fprintf(stderr, "[reembed] %zu segments: %s -> %s\n", rows.size(), m.emb_model.c_str(), target.c_str());
+    EMB_MODEL = target; EMB_DIM = 0;                   // learn the new dim from the first reply
+    g_emb_cpu = env_i("EMB_CPU", 0) != 0;
+    std::string embs; embs.reserve(rows.size() * 1024 * 4);
+    auto t0 = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < rows.size(); i++) {
+        auto e = embed(rows[i].text, false);
+        embs.append((const char*)e.data(), EMB_DIM*4);
+        if ((i+1) % 1000 == 0) {
+            double dt = std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();
+            fprintf(stderr, "[reembed] %zu/%zu (%.0f seg/s)\n", i+1, rows.size(), (i+1)/dt);
+        }
+    }
+    // verified tmp+rename — same ENOSPC discipline as save_catalog (2026-06-06 lesson)
+    std::string tmp = dir + "/embs.f32.tmp";
+    FILE *f = fopen(tmp.c_str(), "wb"); if (!f) fail("cannot write " + tmp);
+    bool bad = embs.size() && fwrite(embs.data(), 1, embs.size(), f) != embs.size();
+    if (fflush(f) != 0 || ferror(f)) bad = true;
+    if (fclose(f) != 0) bad = true;
+    if (bad) { remove(tmp.c_str()); fail("embs save failed (disk full?) — old embs.f32 kept"); }
+    if (rename(tmp.c_str(), (dir + "/embs.f32").c_str()) != 0) fail("embs rename failed — old embs.f32 kept");
+    m.emb_model = EMB_MODEL; m.emb_dim = EMB_DIM;
+    save_manifest(dir, m);
+    fprintf(stderr, "[reembed] done: %s dim=%d, %zu segments\n", EMB_MODEL.c_str(), EMB_DIM, rows.size());
+    return 0;
+}
+
 static int cmd_stats(const std::string &dir) {
     Manifest m; if (!load_manifest(dir, m)) fail("no store at " + dir);
     printf("model=%s (%ld bytes)  kv=%s  build=%s\ntokens=%ld  segments=%ld\n",
@@ -929,8 +1043,11 @@ int main(int argc, char **argv) {
                         "  kvmem serve  <store_dir>            # resident model + HTTP /ask /stats (KVPORT=8345)\n"
                         "  kvmem prune  <store_dir> keep=N|below=W  # sink cold segments (text -> archive.tsv)\n"
                         "  kvmem defrag <store_dir>            # rebuild from stored text (MODEL=... migrates)\n"
+                        "  kvmem reembed <store_dir>           # rewrite embs.f32 with EMB=<model> (bge-m3 etc.)\n"
                         "  kvmem stats  <store_dir>\n"
-                        "env: MODEL=<gguf> KVT=q8_0 NCTX=4096 SEL=3 GAP=0.04 THRESH=0.65 GEN=96 COPYB=2.0 KVSHIFT=1\n");
+                        "env: MODEL=<gguf> KVT=q8_0 NCTX=4096 SEL=3 GAP=0.04 THRESH=0.65 GEN=96 COPYB=2.0 KVSHIFT=1\n"
+                        "     EXTRACT=1 (verbatim stored text)  GROUND=1 (answer in own words from probed text)\n"
+                        "     EMB=<ollama embedding model> (new stores / reembed)\n");
         return 1;
     }
     llama_log_set([](ggml_log_level l, const char *t, void*){ if (l >= GGML_LOG_LEVEL_ERROR) fputs(t, stderr); }, nullptr);
@@ -941,6 +1058,7 @@ int main(int argc, char **argv) {
     if (cmd == "serve")              return cmd_serve(dir);
     if (cmd == "prune"  && argc > 3) return cmd_prune(dir, argv[3]);
     if (cmd == "defrag")             return cmd_defrag(dir);
+    if (cmd == "reembed")            return cmd_reembed(dir);
     if (cmd == "stats")              return cmd_stats(dir);
     fprintf(stderr, "kvmem: bad arguments\n"); return 1;
 }

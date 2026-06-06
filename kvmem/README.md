@@ -82,13 +82,51 @@ fact as confident.
 **log store** is reliable with the hybrid probe + `EXTRACT=1` (grounded retrieval), while free
 generation over arbitrary logs remains confabulation-prone.
 
+## Grounded generation (M6: `GROUND=1`)
+
+`GROUND=1 kvmem ask <store> "q"` answers **in the model's own words** without the confabulation:
+the probe-picked **stored text goes into the prompt** as evidence (chat-template, "use only the
+excerpts"), instead of relying on far-away KV. Prior-dominance loses to text under the model's
+nose — that is the regime instruct models are trained for. Verified on a 38k-segment store of
+real session logs: `what is kvmem` returns the correct tool description (the same question used
+to produce "virtualized memory"); a related-but-partial topic gets an honest "here is what the
+notes say, the decision itself isn't recorded"; an absent fact refuses with exit 2. Uses the GPU
+(the LLM must load); `EXTRACT` stays GPU-free.
+
+Two probe details only the text modes use:
+- **Header expansion** (`MINCH=300`): tiny picked segments (markdown headers — "## what kvmem
+  can do") are pointers to the body right after them; each pick is extended with document-order
+  neighbours until ~MINCH chars. Caught on the full log store, where headers beat bodies.
+- **No GAP cut**: the confidence gap (poc18f) protects KV-restore generation from
+  similar-but-wrong KV; for prompt reading an extra excerpt is cheap and brings the defining
+  segment along. EXTRACT/GROUND always read the full `SEL`.
+
+## Embedder per store (M6: `EMB`, `reembed`)
+
+The embedding model is a **store property** (manifest: `emb_model`, `emb_dim`); mixing embedders
+in one `embs.f32` is garbage, so `ingest` into a store embedded with a different model fails
+loudly. New stores: `EMB=bge-m3 kvmem ingest ...` (default stays `nomic-embed-text`; legacy
+stores without the manifest keys load as nomic/768). Migration:
+
+```bash
+EMB=bge-m3 kvmem reembed mystore     # rewrites embs.f32 from the stored text (~10 seg/s via ollama)
+```
+
+Why bge-m3: nomic is EN-centric — on Russian queries it returns wrong segments with *high*
+cosine (anisotropy; measured 0.80 on an unrelated segment). bge-m3 fixed the RU channel on the
+real log store ("что мы решили про вайфай планшета" → the exact wifi complaint, where nomic
+returned an unrelated discussion). **Cosine scales differ per embedder** — recalibrate `THRESH`
+after a reembed (bge-m3 on the log store: positives 0.61–0.75, absent 0.47–0.53 → `THRESH=0.57`;
+the 0.65 default is nomic-scale). On tiny stores positives sit lower (~0.52–0.59) — the
+low-confidence flag is a warning, tune per store.
+
 ## Store layout (`mystore/`)
 
 ```
-manifest.txt     model_file, model_bytes, kv_type, build, total_tokens, n_segments
+manifest.txt     model_file, model_bytes, kv_type, build, total_tokens, n_segments, emb_model, emb_dim
 catalog.tsv      id  lo  hi  w  text          (source text kept next to KV = re-decode insurance)
-embs.f32         float32[n_segments][768]      (nomic embeddings for the probe)
-segments/N.kv    serialized KV range for segment N (llama_state_seq; build-sensitive)
+embs.f32         float32[n_segments][emb_dim]  (probe embeddings; emb_model in the manifest)
+segments/N.kv    serialized KV range for segment N (llama_state_seq; build-sensitive; absent in TEXTONLY stores)
 ```
 
 The source text is stored beside the KV on purpose: if the model, quant, or llama.cpp build
@@ -104,9 +142,11 @@ g++ -O2 -o kvmem kvmem.cpp -I <llama.cpp>/include -I <llama.cpp>/ggml/include \
     -L <llama.cpp>/build/bin -lllama -Wl,-rpath,<llama.cpp>/build/bin
 ```
 
-Needs ollama with `nomic-embed-text` for the catalog. Env: `MODEL` (gguf path), `KVT=q8_0`,
-`NCTX=4096`, `SEL=3`, `GAP=0.04`, `THRESH=0.65`, `GEN=96`, `DECAY=0.9`, `COPYB=2.0`,
-`EMB_CPU=1` (chat keeps the LLM resident, so nomic embeds on CPU to avoid fighting it for VRAM).
+Needs ollama with the store's embedding model for the catalog. Env: `MODEL` (gguf path),
+`KVT=q8_0`, `NCTX=4096`, `SEL=3`, `GAP=0.04`, `THRESH=0.65` (nomic scale; see reembed section),
+`GEN=96`, `DECAY=0.9`, `COPYB=2.0`, `EXTRACT=1` / `GROUND=1` (text answer modes), `MINCH=300`,
+`EMB=<ollama model>` (new stores / reembed), `TEXTONLY=1` (catalog+embs only, no KV — log stores),
+`EMB_CPU=1` (chat keeps the LLM resident, so the embedder runs on CPU to avoid fighting it for VRAM).
 
 ## Chat notes
 
@@ -146,8 +186,8 @@ when defrag genuinely shrinks the store (e.g. 25 195 → 344 tokens after prunin
 
 ## Status
 
-M5 of the session-memory driver: ingest / ask / chat (ask-fallback) / serve / prune / defrag /
-stats, hybrid probe + `EXTRACT` mode, Hermes skill. Verified on Qwen2.5-7B-1M: a solid fact store
-(generation), and reliable log retrieval via hybrid probe + `EXTRACT`. Open: free generation over
-arbitrary logs (prior-dominance), a self-embedding probe channel, OpenAI-style API, 4-bit cold
-store.
+M6 of the session-memory driver: ingest / ask / chat (ask-fallback) / serve / prune / defrag /
+reembed / stats, hybrid probe, `EXTRACT` (verbatim) + `GROUND` (own words, evidence-in-prompt)
+modes, per-store embedder (bge-m3 fixes RU). Verified on Qwen2.5-7B-1M: a solid fact store
+(generation), reliable log retrieval (`EXTRACT`) and grounded log answers (`GROUND`). Open: a
+self-embedding probe channel, OpenAI-style API, 4-bit cold store.
